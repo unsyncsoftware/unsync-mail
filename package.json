@@ -1,0 +1,32 @@
+{
+  "name": "unsync-mail",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc && node copy-assets.js",
+    "start": "npm run build && electron .",
+    "test": "npm run build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/imap": "^0.8.43",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^25.9.1",
+    "@types/nodemailer": "^8.0.0",
+    "electron": "^35.7.5",
+    "electron-rebuild": "^3.2.9",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "imap": "^0.8.19",
+    "mailparser": "^3.9.8",
+    "nodemailer": "^8.0.7",
+    "openpgp": "^6.3.0"
+  }
+}
