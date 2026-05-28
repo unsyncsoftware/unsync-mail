@@ -2010,10 +2010,14 @@ function sendReaderPage(response, portalId) {
 
         <form id="token-form" class="token-form" autocomplete="off">
           <input type="hidden" id="portal-id" value="${safePortalId}">
-          <label for="recipient-email">Recipient email</label>
-          <input id="recipient-email" name="recipient-email" type="email" autocomplete="email" spellcheck="false" required>
-          <label for="access-token">Access token</label>
-          <input id="access-token" name="access-token" type="password" autocomplete="off" spellcheck="false" required>
+          <div id="recipient-field">
+            <label for="recipient-email">Recipient email</label>
+            <input id="recipient-email" name="recipient-email" type="email" autocomplete="email" spellcheck="false" required>
+          </div>
+          <div id="token-field">
+            <label for="access-token">Access token</label>
+            <input id="access-token" name="access-token" type="password" autocomplete="off" spellcheck="false" required>
+          </div>
           <div id="otp-fields" hidden>
             <label for="otp-code">Verification code</label>
             <input id="otp-code" name="otp-code" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" spellcheck="false">
@@ -2022,6 +2026,13 @@ function sendReaderPage(response, portalId) {
         </form>
 
         <article id="message-content" class="message" hidden>
+          <div id="message-toolbar" class="message-toolbar" hidden>
+            <p id="session-status" class="session-status"></p>
+            <div class="message-actions">
+              <button id="reply-button" type="button">Reply</button>
+              <button id="forward-button" type="button">Forward</button>
+            </div>
+          </div>
           <h2 id="message-subject"></h2>
           <pre id="message-body"></pre>
           <section id="attachment-section" class="attachments" hidden>
@@ -2192,6 +2203,10 @@ h1 {
   margin-top: 24px;
 }
 
+.token-form.is-complete {
+  display: none;
+}
+
 label {
   color: #dce4ea;
   font-size: 13px;
@@ -2229,6 +2244,36 @@ button {
 button:disabled {
   cursor: wait;
   opacity: 0.7;
+}
+
+.message-toolbar {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 18px;
+}
+
+.session-status {
+  color: #8ee6c8;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.message-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.message-actions button {
+  background: #161e27;
+  color: #e6edf3;
+  border-color: #3a4653;
+  padding: 9px 12px;
+}
+
+.message-actions button:hover {
+  border-color: #8ee6c8;
 }
 
 .message {
@@ -2281,6 +2326,20 @@ button:disabled {
   font-size: 12px;
   margin-top: 2px;
 }
+
+@media (max-width: 540px) {
+  .message-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .message-actions {
+    width: 100%;
+  }
+
+  .message-actions button {
+    flex: 1;
+  }
+}
 `;
 
 const readerJs = `
@@ -2289,13 +2348,19 @@ const readerJs = `
 
   const form = document.getElementById("token-form");
   const portalIdInput = document.getElementById("portal-id");
+  const recipientField = document.getElementById("recipient-field");
   const recipientEmailInput = document.getElementById("recipient-email");
+  const tokenField = document.getElementById("token-field");
   const tokenInput = document.getElementById("access-token");
   const otpFields = document.getElementById("otp-fields");
   const otpInput = document.getElementById("otp-code");
   const decryptButton = document.getElementById("decrypt-button");
   const stateMessage = document.getElementById("state-message");
   const messageContent = document.getElementById("message-content");
+  const messageToolbar = document.getElementById("message-toolbar");
+  const sessionStatus = document.getElementById("session-status");
+  const replyButton = document.getElementById("reply-button");
+  const forwardButton = document.getElementById("forward-button");
   const messageSubject = document.getElementById("message-subject");
   const messageBody = document.getElementById("message-body");
   const attachmentSection = document.getElementById("attachment-section");
@@ -2306,6 +2371,8 @@ const readerJs = `
   let plaintextSubject = "";
   let plaintextBody = "";
   let decryptedMetadata = null;
+  let replyMailto = "";
+  let forwardMailto = "";
   let attachmentDescriptors = [];
   let attachmentObjectUrls = [];
   let accessToken = "";
@@ -2319,8 +2386,31 @@ const readerJs = `
     void continueVerificationFlow();
   });
 
+  replyButton.addEventListener("click", () => {
+    openMailto(replyMailto);
+  });
+  forwardButton.addEventListener("click", () => {
+    openMailto(forwardMailto);
+  });
+
   window.addEventListener("beforeunload", clearPlaintext);
   window.addEventListener("pagehide", clearPlaintext);
+  prefillTokenFromHash();
+
+  function prefillTokenFromHash() {
+    if (!window.location.hash || window.location.hash.length <= 1) {
+      return;
+    }
+
+    const hashToken = decodeURIComponent(window.location.hash.slice(1));
+
+    if (hashToken) {
+      tokenInput.value = hashToken;
+      accessToken = hashToken;
+    }
+
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  }
 
   async function continueVerificationFlow() {
     if (!verifiedSessionToken && otpFields.hidden) {
@@ -2487,8 +2577,11 @@ const readerJs = `
       renderAttachmentList();
       tokenInput.value = "";
       accessToken = "";
+      const timeoutSeconds = Number(metadata.idleTimeoutSeconds || portalRecord.idleTimeoutSeconds || 300);
+      prepareMessageActions(metadata, plaintextSubject, plaintextBody);
+      showDecryptedSession(timeoutSeconds);
       setState("Decrypted locally in this browser.", "success");
-      startIdleTimeout(Number(metadata.idleTimeoutSeconds || portalRecord.idleTimeoutSeconds || 300));
+      startIdleTimeout(timeoutSeconds);
     } catch (error) {
       clearPlaintext();
       setState(error instanceof Error ? error.message : "Unable to decrypt secure message.", "error");
@@ -2573,6 +2666,99 @@ const readerJs = `
       row.append(details, button);
       attachmentList.append(row);
     }
+  }
+
+  function prepareMessageActions(metadata, subject, body) {
+    const sender = getOriginalSender(metadata);
+    const replySubject = prefixSubject("Re:", subject);
+    const forwardSubject = prefixSubject("Fwd:", subject);
+    const quotedBody = buildQuotedBody(body);
+
+    replyMailto = buildMailto(sender, replySubject, quotedBody);
+    forwardMailto = buildMailto("", forwardSubject, quotedBody);
+    replyButton.disabled = !sender;
+    forwardButton.disabled = false;
+  }
+
+  function showDecryptedSession(timeoutSeconds) {
+    form.classList.add("is-complete");
+    recipientField.hidden = true;
+    tokenField.hidden = true;
+    otpFields.hidden = true;
+    decryptButton.hidden = true;
+    tokenInput.required = false;
+    recipientEmailInput.required = false;
+    otpInput.required = false;
+    messageToolbar.hidden = false;
+    sessionStatus.textContent = "Session active. Idle timeout: " + formatDuration(timeoutSeconds) + ".";
+  }
+
+  function restoreVerificationUi() {
+    form.classList.remove("is-complete");
+    recipientField.hidden = false;
+    tokenField.hidden = false;
+    decryptButton.hidden = false;
+    messageToolbar.hidden = true;
+    sessionStatus.textContent = "";
+  }
+
+  function getOriginalSender(metadata) {
+    const candidates = [metadata.from, metadata.sender, metadata.replyTo, metadata.fromAddress];
+
+    for (const candidate of candidates) {
+      const email = extractEmail(candidate);
+
+      if (email) {
+        return email;
+      }
+    }
+
+    return "";
+  }
+
+  function extractEmail(value) {
+    if (typeof value !== "string") {
+      return "";
+    }
+
+    const match = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);
+    return match ? match[0] : "";
+  }
+
+  function prefixSubject(prefix, subject) {
+    const normalizedSubject = String(subject || "").trim() || "(no subject)";
+    return normalizedSubject.toLowerCase().startsWith(prefix.toLowerCase())
+      ? normalizedSubject
+      : prefix + " " + normalizedSubject;
+  }
+
+  function buildQuotedBody(body) {
+    const text = String(body || "").trim();
+
+    if (!text) {
+      return "";
+    }
+
+    return "\\n\\n--- Original secure message ---\\n" + text.split("\\n").map((line) => "> " + line).join("\\n");
+  }
+
+  function buildMailto(to, subject, body) {
+    const params = new URLSearchParams();
+    params.set("subject", subject);
+
+    if (body) {
+      params.set("body", body);
+    }
+
+    return "mailto:" + encodeURIComponent(to || "") + "?" + params.toString();
+  }
+
+  function openMailto(url) {
+    if (!url) {
+      return;
+    }
+
+    window.location.href = url;
   }
 
   async function downloadAttachment(attachment, button) {
@@ -2683,11 +2869,17 @@ const readerJs = `
     plaintextSubject = "";
     plaintextBody = "";
     decryptedMetadata = null;
+    replyMailto = "";
+    forwardMailto = "";
     messageSubject.textContent = "";
     messageBody.textContent = "";
     attachmentList.replaceChildren();
     attachmentSection.hidden = true;
     messageContent.hidden = true;
+    messageToolbar.hidden = true;
+    sessionStatus.textContent = "";
+    replyButton.disabled = true;
+    forwardButton.disabled = true;
 
     if (idleController) {
       idleController.abort();
@@ -2700,6 +2892,11 @@ const readerJs = `
     if (clearSession) {
       accessToken = "";
       verifiedSessionToken = "";
+      restoreVerificationUi();
+      tokenInput.disabled = false;
+      recipientEmailInput.disabled = false;
+      tokenInput.required = true;
+      recipientEmailInput.required = true;
     }
   }
 
@@ -2746,6 +2943,22 @@ const readerJs = `
     }
 
     return size.toFixed(unitIndex === 0 ? 0 : 1) + " " + units[unitIndex];
+  }
+
+  function formatDuration(seconds) {
+    const totalSeconds = Math.max(1, Math.floor(Number(seconds) || 300));
+    const minutes = Math.floor(totalSeconds / 60);
+    const remainingSeconds = totalSeconds % 60;
+
+    if (minutes > 0 && remainingSeconds > 0) {
+      return minutes + "m " + remainingSeconds + "s";
+    }
+
+    if (minutes > 0) {
+      return minutes + "m";
+    }
+
+    return remainingSeconds + "s";
   }
 
   async function friendlyAuthError(response) {
