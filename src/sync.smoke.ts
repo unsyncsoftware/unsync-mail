@@ -131,6 +131,30 @@ async function main(): Promise<void> {
       /protected by Unsync Shield/,
     );
 
+    const missingKeyTransport = new MockTransport();
+    const portalResult = await sendEmail({
+      smtp: { host: "smtp.example.test", port: 587, secure: false },
+      draft: {
+        from: "local@example.test",
+        to: "missing@example.test",
+        subject: "Missing key",
+        text: "Do not send this as plaintext.",
+      },
+      useUnsyncShield: true,
+      database,
+      transport: missingKeyTransport,
+    });
+    assert.equal(portalResult.deliveryMode, "secure_portal");
+    assert.match(portalResult.portal?.portalUrl ?? "", /^https:\/\/mail\.unsync\.uk\/read\//);
+    assert.match(
+      missingKeyTransport.sent[0]?.text?.toString() ?? "",
+      /This message was sent securely using Unsync Mail/,
+    );
+    assert.doesNotMatch(
+      missingKeyTransport.sent[0]?.text?.toString() ?? "",
+      /Do not send this as plaintext/,
+    );
+
     const standardTransport = new MockTransport();
     await sendEmail({
       smtp: { host: "smtp.example.test", port: 587, secure: false },

@@ -20,7 +20,7 @@ export interface DecryptTextInput {
     database?: DatabaseConnection;
 }
 export declare function generateUserKey(input: GenerateUserKeyInput): Promise<GeneratedUserKey>;
-export declare function encryptText(plaintext: string, recipientPublicKeyArmored: string): Promise<string>;
+export declare function encryptText(plaintext: string, recipientPublicKeyArmored: string | string[]): Promise<string>;
 export declare function decryptText(armoredCiphertext: string, input: DecryptTextInput): Promise<string>;
 export declare function generateSafetyNumber(firstPublicKeyArmored: string, secondPublicKeyArmored: string): Promise<string>;
 //# sourceMappingURL=crypto.d.ts.map

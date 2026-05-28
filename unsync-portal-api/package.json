@@ -1,0 +1,14 @@
+{
+  "name": "unsync-portal-api",
+  "version": "1.0.0",
+  "description": "Minimal encrypted payload API for Unsync secure portal messages.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  }
+}

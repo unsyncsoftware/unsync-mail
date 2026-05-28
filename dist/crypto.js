@@ -71,12 +71,20 @@ async function generateUserKey(input) {
 }
 async function encryptText(plaintext, recipientPublicKeyArmored) {
     assertNonEmpty(plaintext, "plaintext");
-    assertNonEmpty(recipientPublicKeyArmored, "recipientPublicKeyArmored");
-    const recipientPublicKey = await readPublicKey(recipientPublicKeyArmored);
+    const recipientPublicKeysArmored = Array.isArray(recipientPublicKeyArmored)
+        ? recipientPublicKeyArmored
+        : [recipientPublicKeyArmored];
+    if (recipientPublicKeysArmored.length === 0) {
+        throw new Error("recipientPublicKeyArmored must not be empty.");
+    }
+    for (const publicKeyArmored of recipientPublicKeysArmored) {
+        assertNonEmpty(publicKeyArmored, "recipientPublicKeyArmored");
+    }
+    const recipientPublicKeys = await Promise.all(recipientPublicKeysArmored.map((publicKeyArmored) => readPublicKey(publicKeyArmored)));
     const message = await openpgp.createMessage({ text: plaintext });
     return openpgp.encrypt({
         message,
-        encryptionKeys: recipientPublicKey,
+        encryptionKeys: recipientPublicKeys,
         format: "armored",
     });
 }

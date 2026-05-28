@@ -75,13 +75,13 @@
     <main class="app-shell">
       <aside class="sidebar" aria-label="Folders">
         <nav class="sidebar-folders" aria-label="Mail folders">
-          <button class="sidebar-folder is-active" type="button" data-folder="Inbox">Inbox</button>
-          <button class="sidebar-folder" type="button" data-folder="Sent Items">Sent</button>
-          <button class="sidebar-folder" type="button" data-folder="Outbox">Outbox</button>
-          <button class="sidebar-folder" type="button" data-folder="Drafts">Drafts</button>
-          <button class="sidebar-folder" type="button" data-folder="Archive">Archive</button>
-          <button class="sidebar-folder" type="button" data-folder="Junk Email">Spam/Junk</button>
-          <button class="sidebar-folder" type="button" data-folder="Deleted Items">Trash</button>
+          <button class="sidebar-folder is-active" type="button" data-folder="inbox">Inbox</button>
+          <button class="sidebar-folder" type="button" data-folder="sent">Sent</button>
+          <button class="sidebar-folder" type="button" data-folder="outbox">Outbox</button>
+          <button class="sidebar-folder" type="button" data-folder="drafts">Drafts</button>
+          <button class="sidebar-folder" type="button" data-folder="archive">Archive</button>
+          <button class="sidebar-folder" type="button" data-folder="spam">Spam/Junk</button>
+          <button class="sidebar-folder" type="button" data-folder="trash">Trash</button>
         </nav>
 
         <div class="sidebar-calendar-widget">
@@ -116,7 +116,18 @@
 
       <section class="feed-pane" aria-label="Messages">
         <header class="feed-header">
-          <h1>Inbox</h1>
+          <h1 id="feed-title">Inbox</h1>
+
+          <div class="panel2-master-header">
+            <div class="master-select-wrapper">
+              <input type="checkbox" id="master-select-all" />
+            </div>
+            <div class="panel2-header-actions">
+              <button id="btn-hdr-jump" title="Jump to..." type="button">📂</button>
+              <button id="btn-hdr-filter" title="Filter Mail" type="button">⏳</button>
+              <button id="btn-hdr-sort" title="Sort by Date" type="button">📅</button>
+            </div>
+          </div>
         </header>
 
         <div id="message-list" class="message-list"></div>
@@ -153,20 +164,29 @@
           </div>
         </div>
         <div class="reader-metadata-ribbon">
-          <div class="aligned-meta-block">
-            <div class="meta-line"><span class="meta-key">From</span><span class="meta-colon">:</span><span id="meta-exact-from" class="meta-val">...</span></div>
-            <div class="meta-line"><span class="meta-key">To</span><span class="meta-colon">:</span><span id="meta-exact-to" class="meta-val">...</span></div>
-            <div class="meta-line"><span class="meta-key">Date</span><span class="meta-colon">:</span><span id="meta-exact-date" class="meta-val">...</span></div>
+          <div class="reader-sender-row">
+            <div id="reader-sender-avatar" class="sender-avatar">?</div>
+            <div class="sender-identity">
+              <div class="sender-name-line">
+                <strong id="meta-exact-from">Unknown sender</strong>
+              </div>
+              <div class="sender-to-line">To: <span id="meta-exact-to">Unknown account</span></div>
+            </div>
+            <div id="meta-exact-date" class="reader-message-date">Unknown date</div>
           </div>
         </div>
-        <iframe
-          id="reader-iframe"
-          class="reader-iframe"
-          sandbox="allow-popups"
-          partition="persist:email-reader"
-          referrerpolicy="no-referrer"
-          title="Email body"
-        ></iframe>
+        <div class="reader-body-shell">
+          <div class="reader-body-card">
+            <iframe
+              id="reader-iframe"
+              class="reader-iframe"
+              sandbox="allow-popups"
+              partition="persist:email-reader"
+              referrerpolicy="no-referrer"
+              title="Email body"
+            ></iframe>
+          </div>
+        </div>
       </section>
     </main>
 
@@ -243,7 +263,7 @@
         <div class="compose-grid">
           <label>
             <span>To</span>
-            <input id="compose-to" type="email" autocomplete="email" required />
+            <input id="compose-to" type="email" autocomplete="email" multiple required />
           </label>
           <label>
             <span>CC</span>
@@ -264,7 +284,7 @@
         </div>
 
         <label class="shield-toggle">
-          <input id="compose-shield" type="checkbox" />
+          <input id="compose-shield" type="checkbox" checked />
           <span>Use Unsync Shield</span>
         </label>
 
@@ -285,6 +305,23 @@
     </dialog>
 
     <div id="toast" class="toast" hidden></div>
+
+    <div id="custom-context-menu" class="context-menu-hidden">
+      <div class="context-menu-item" id="ctx-mark-read">Mark as Read</div>
+      <div class="context-menu-item" id="ctx-mark-unread">Mark as Unread</div>
+      <hr class="context-menu-divider" />
+      <div class="context-menu-item context-menu-danger" id="ctx-delete">Delete</div>
+      <div class="context-menu-item" id="ctx-archive">Archive</div>
+      <div class="context-menu-item" id="ctx-spam">Report Spam</div>
+    </div>
+
+    <div id="reader-more-menu" class="reader-more-menu context-menu-hidden">
+      <div class="context-menu-item" id="reader-more-mark-unread">Mark as Unread</div>
+      <div class="context-menu-item" id="reader-more-mark-read">Mark as Read</div>
+      <hr class="context-menu-divider" />
+      <div class="context-menu-item" id="reader-more-archive">Archive</div>
+      <div class="context-menu-item context-menu-danger" id="reader-more-trash">Move to Trash</div>
+    </div>
 
     <script src="../dist/renderer.js"></script>
   </body>

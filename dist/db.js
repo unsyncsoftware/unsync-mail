@@ -8,9 +8,12 @@ exports.initializeSchema = initializeSchema;
 exports.searchEmails = searchEmails;
 exports.listEmails = listEmails;
 exports.getEmailById = getEmailById;
+exports.moveEmailToMailbox = moveEmailToMailbox;
+exports.updateEmailReadState = updateEmailReadState;
 exports.saveUserKey = saveUserKey;
 exports.getActiveUserKey = getActiveUserKey;
 exports.saveEmail = saveEmail;
+exports.saveSecurePortalPayload = saveSecurePortalPayload;
 exports.getContactPublicKey = getContactPublicKey;
 exports.saveContactPublicKey = saveContactPublicKey;
 exports.saveMailAccount = saveMailAccount;
@@ -103,11 +106,31 @@ function initializeSchema(database) {
       local_search_text TEXT NOT NULL DEFAULT '',
       is_unsync_encrypted INTEGER NOT NULL DEFAULT 0
         CHECK (is_unsync_encrypted IN (0, 1)),
+      delivery_mode TEXT NOT NULL DEFAULT 'standard'
+        CHECK (delivery_mode IN ('standard', 'unsync_direct', 'secure_portal')),
+      secure_portal_id TEXT,
+      secure_portal_url TEXT,
       headers_json TEXT NOT NULL DEFAULT '{}',
       flags_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
       UNIQUE (account_id, provider_message_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS secure_portal_payloads (
+      portal_id TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      sender_account_id TEXT NOT NULL,
+      recipient_email TEXT NOT NULL,
+      encrypted_payload TEXT NOT NULL,
+      portal_url TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      idle_timeout_seconds INTEGER NOT NULL,
+      is_consumed INTEGER NOT NULL DEFAULT 0 CHECK (is_consumed IN (0, 1)),
+      one_time_read INTEGER NOT NULL DEFAULT 1 CHECK (one_time_read IN (0, 1)),
+      last_access_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
 
     CREATE INDEX IF NOT EXISTS idx_contacts_email_address
@@ -121,6 +144,12 @@ function initializeSchema(database) {
 
     CREATE INDEX IF NOT EXISTS idx_mail_accounts_email_address
       ON mail_accounts (email_address);
+
+    CREATE INDEX IF NOT EXISTS idx_secure_portal_payloads_expires
+      ON secure_portal_payloads (expires_at);
+
+    CREATE INDEX IF NOT EXISTS idx_secure_portal_payloads_recipient
+      ON secure_portal_payloads (recipient_email);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS email_fts USING fts5(
       subject,
@@ -221,6 +250,9 @@ function initializeSchema(database) {
     END;
   `);
     addColumnIfMissing(database, "emails", "is_unsync_encrypted", "INTEGER NOT NULL DEFAULT 0 CHECK (is_unsync_encrypted IN (0, 1))");
+    addColumnIfMissing(database, "emails", "delivery_mode", "TEXT NOT NULL DEFAULT 'standard' CHECK (delivery_mode IN ('standard', 'unsync_direct', 'secure_portal'))");
+    addColumnIfMissing(database, "emails", "secure_portal_id", "TEXT");
+    addColumnIfMissing(database, "emails", "secure_portal_url", "TEXT");
 }
 function searchEmails(query, options = {}, database = getDatabase()) {
     const ftsQuery = toFtsPrefixQuery(query);
@@ -327,6 +359,44 @@ function getEmailById(id, database = getDatabase()) {
     `)
         .get({ id });
 }
+function moveEmailToMailbox(id, mailbox, database = getDatabase()) {
+    const result = database
+        .prepare(`
+      UPDATE emails
+      SET mailbox = @mailbox,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE id = @id
+    `)
+        .run({ id, mailbox });
+    return result.changes > 0;
+}
+function updateEmailReadState(id, isRead, database = getDatabase()) {
+    const row = database
+        .prepare(`
+      SELECT flags_json AS flagsJson
+      FROM emails
+      WHERE id = @id
+      LIMIT 1
+    `)
+        .get({ id });
+    if (!row) {
+        return false;
+    }
+    const flags = parseEmailFlags(row.flagsJson);
+    flags.isRead = isRead;
+    const result = database
+        .prepare(`
+      UPDATE emails
+      SET flags_json = @flagsJson,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE id = @id
+    `)
+        .run({
+        id,
+        flagsJson: JSON.stringify(flags),
+    });
+    return result.changes > 0;
+}
 function saveUserKey(input, database = getDatabase()) {
     return database.transaction(() => {
         database
@@ -401,6 +471,9 @@ function saveEmail(input, database = getDatabase()) {
         decryptedPreview: input.decryptedPreview ?? "",
         localSearchText: input.localSearchText ?? "",
         isUnsyncEncrypted: input.isUnsyncEncrypted ? 1 : 0,
+        deliveryMode: input.deliveryMode ?? (input.isUnsyncEncrypted ? "unsync_direct" : "standard"),
+        securePortalId: input.securePortalId ?? null,
+        securePortalUrl: input.securePortalUrl ?? null,
         headersJson: input.headersJson ?? "{}",
         flagsJson: input.flagsJson ?? "{}",
     };
@@ -423,6 +496,9 @@ function saveEmail(input, database = getDatabase()) {
         decrypted_preview,
         local_search_text,
         is_unsync_encrypted,
+        delivery_mode,
+        secure_portal_id,
+        secure_portal_url,
         headers_json,
         flags_json
       )
@@ -443,6 +519,9 @@ function saveEmail(input, database = getDatabase()) {
         @decryptedPreview,
         @localSearchText,
         @isUnsyncEncrypted,
+        @deliveryMode,
+        @securePortalId,
+        @securePortalUrl,
         @headersJson,
         @flagsJson
       )
@@ -461,6 +540,9 @@ function saveEmail(input, database = getDatabase()) {
         decrypted_preview = excluded.decrypted_preview,
         local_search_text = excluded.local_search_text,
         is_unsync_encrypted = excluded.is_unsync_encrypted,
+        delivery_mode = excluded.delivery_mode,
+        secure_portal_id = excluded.secure_portal_id,
+        secure_portal_url = excluded.secure_portal_url,
         headers_json = excluded.headers_json,
         flags_json = excluded.flags_json,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -484,6 +566,67 @@ function saveEmail(input, database = getDatabase()) {
     }
     return savedEmail;
 }
+function saveSecurePortalPayload(input, database = getDatabase()) {
+    const params = {
+        portalId: input.portalId,
+        accessToken: input.accessToken,
+        senderAccountId: input.senderAccountId,
+        recipientEmail: input.recipientEmail,
+        encryptedPayload: input.encryptedPayload,
+        portalUrl: input.portalUrl,
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+        idleTimeoutSeconds: input.idleTimeoutSeconds,
+        isConsumed: input.isConsumed ? 1 : 0,
+        oneTimeRead: input.oneTimeRead ?? true ? 1 : 0,
+        lastAccessAt: input.lastAccessAt ?? null,
+    };
+    database
+        .prepare(`
+      INSERT INTO secure_portal_payloads (
+        portal_id,
+        access_token,
+        sender_account_id,
+        recipient_email,
+        encrypted_payload,
+        portal_url,
+        created_at,
+        expires_at,
+        idle_timeout_seconds,
+        is_consumed,
+        one_time_read,
+        last_access_at
+      )
+      VALUES (
+        @portalId,
+        @accessToken,
+        @senderAccountId,
+        @recipientEmail,
+        @encryptedPayload,
+        @portalUrl,
+        @createdAt,
+        @expiresAt,
+        @idleTimeoutSeconds,
+        @isConsumed,
+        @oneTimeRead,
+        @lastAccessAt
+      )
+      ON CONFLICT (portal_id) DO UPDATE SET
+        access_token = excluded.access_token,
+        sender_account_id = excluded.sender_account_id,
+        recipient_email = excluded.recipient_email,
+        encrypted_payload = excluded.encrypted_payload,
+        portal_url = excluded.portal_url,
+        created_at = excluded.created_at,
+        expires_at = excluded.expires_at,
+        idle_timeout_seconds = excluded.idle_timeout_seconds,
+        is_consumed = excluded.is_consumed,
+        one_time_read = excluded.one_time_read,
+        last_access_at = excluded.last_access_at,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    `)
+        .run(params);
+}
 function getContactPublicKey(emailAddress, database = getDatabase()) {
     return database
         .prepare(`
@@ -491,7 +634,7 @@ function getContactPublicKey(emailAddress, database = getDatabase()) {
         FROM contacts
        WHERE lower(email_address) = lower(@emailAddress)
          AND public_key_armored IS NOT NULL
-         AND trust_state != 'blocked'
+         AND trust_state = 'trusted'
        LIMIT 1
     `)
         .get({ emailAddress })?.publicKeyArmored;
@@ -662,6 +805,18 @@ function clampResultWindow(value) {
         return 25;
     }
     return Math.min(Math.max(Math.floor(value), 1), 100);
+}
+function parseEmailFlags(value) {
+    try {
+        const parsed = JSON.parse(value || "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return parsed;
+        }
+    }
+    catch {
+        // Corrupt flags should not block mailbox actions.
+    }
+    return {};
 }
 function validatePort(port, label) {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {

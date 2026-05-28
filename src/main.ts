@@ -20,14 +20,23 @@ import {
   getMailAccountByEmail,
   listEmails,
   listMailAccounts,
+  moveEmailToMailbox,
   saveMailAccount,
   searchEmails,
   type StoredMailAccount,
+  updateEmailReadState,
 } from "./db";
-import { sendEmail, syncInbox, type EmailDraft, type SyncInboxResult } from "./sync";
+import {
+  isSendEmailError,
+  sendEmail,
+  syncInbox,
+  type EmailDraft,
+  type SyncInboxResult,
+} from "./sync";
 
 const DEFAULT_UI_USER_ID = "local-user";
 const SAFE_STORAGE_PREFIX = "safe:v1:";
+const AUTO_SYNC_INTERVAL_MS = 3 * 60 * 1000;
 
 interface SyncStatusEvent {
   state: "syncing" | "synced" | "error";
@@ -45,6 +54,8 @@ interface RendererAttachment {
 let mainWindow: BrowserWindow | undefined;
 let database: DatabaseConnection | undefined;
 let currentEmailHtml = "";
+let autoSyncTimer: ReturnType<typeof setInterval> | undefined;
+let syncInProgress = false;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -80,6 +91,13 @@ function createMainWindow(): void {
   mainWindow.loadFile(path.join(__dirname, "..", "public", "index.html"));
 
   mainWindow.webContents.openDevTools({ mode: "detach" });
+  mainWindow.webContents.once("did-finish-load", () => {
+    startAutoSyncLoop();
+  });
+  mainWindow.once("closed", () => {
+    stopAutoSyncLoop();
+    mainWindow = undefined;
+  });
 }
 
 function getPlatformWindowChrome(): Pick<
@@ -235,15 +253,7 @@ function registerIpcHandlers(): void {
       db,
     );
 
-    const syncResult = await syncInboxForAccount(account, ["ALL"]);
-    publishSyncStatus({
-      state: "synced",
-      message: `Inbox synced. Saved ${syncResult.saved} message(s).`,
-      fetched: syncResult.fetched,
-      saved: syncResult.saved,
-      encrypted: syncResult.encrypted,
-    });
-    publishMailboxUpdated();
+    await syncInboxForAccounts([account], "manual", ["ALL"]);
 
     return listMailAccounts(db).map(toRendererAccount);
   });
@@ -258,29 +268,7 @@ function registerIpcHandlers(): void {
       throw new Error("No mail account is configured.");
     }
 
-    let totalFetched = 0;
-    let totalSaved = 0;
-    let totalEncrypted = 0;
-
-    for (const account of accountsToSync) {
-      const result = await syncInboxForAccount(account, getRecentInboxCriteria());
-      totalFetched += result.fetched;
-      totalSaved += result.saved;
-      totalEncrypted += result.encrypted;
-    }
-
-    const status: SyncStatusEvent = {
-      state: "synced",
-      message: `Inbox synced. Saved ${totalSaved} new/updated message(s).`,
-      fetched: totalFetched,
-      saved: totalSaved,
-      encrypted: totalEncrypted,
-    };
-
-    publishSyncStatus(status);
-    publishMailboxUpdated();
-
-    return status;
+    return syncInboxForAccounts(accountsToSync, "manual", getRecentInboxCriteria());
   });
 
   ipcMain.handle("mail:set-reader-content", async (_event, html: string) => {
@@ -288,7 +276,7 @@ function registerIpcHandlers(): void {
     return true;
   });
 
-  ipcMain.handle("mail:get-folder-emails", (_event, folderName: string, accountEmail?: string) => {
+  ipcMain.handle("mail:get-folder-emails", (_event, folderName: string, accountEmail?: string, query?: string) => {
     if (typeof folderName !== "string" || !folderName.trim()) {
       throw new Error("Folder name is required.");
     }
@@ -297,7 +285,87 @@ function registerIpcHandlers(): void {
       throw new Error("Account filter must be text.");
     }
 
-    return getFolderEmails(folderName, accountEmail?.trim() || undefined, getAppDatabase());
+    if (query !== undefined && typeof query !== "string") {
+      throw new Error("Search query must be text.");
+    }
+
+    return getFolderEmails(
+      folderName,
+      accountEmail?.trim() || undefined,
+      query?.trim() || undefined,
+      getAppDatabase(),
+    );
+  });
+
+  ipcMain.handle("mail:move-email", (_event, emailId: number, folderKey: string) => {
+    assertPositiveInteger(emailId, "email id");
+
+    if (typeof folderKey !== "string" || !folderKey.trim()) {
+      throw new Error("Folder key is required.");
+    }
+
+    const mailbox = getActionMailbox(folderKey);
+    const moved = moveEmailToMailbox(emailId, mailbox, getAppDatabase());
+
+    if (!moved) {
+      throw new Error(`Email ${emailId} was not found.`);
+    }
+
+    publishMailboxUpdated();
+    return true;
+  });
+
+  ipcMain.handle("mail:delete-email-to-trash", (_event, emailId: number) => {
+    assertPositiveInteger(emailId, "email id");
+    const moved = moveEmailToMailbox(emailId, getActionMailbox("trash"), getAppDatabase());
+
+    if (!moved) {
+      throw new Error(`Email ${emailId} was not found.`);
+    }
+
+    publishMailboxUpdated();
+    return true;
+  });
+
+  ipcMain.handle("mail:report-email-spam", (_event, emailId: number) => {
+    assertPositiveInteger(emailId, "email id");
+    const moved = moveEmailToMailbox(emailId, getActionMailbox("spam"), getAppDatabase());
+
+    if (!moved) {
+      throw new Error(`Email ${emailId} was not found.`);
+    }
+
+    publishMailboxUpdated();
+    return true;
+  });
+
+  ipcMain.handle("mail:archive-email", (_event, emailId: number) => {
+    assertPositiveInteger(emailId, "email id");
+    const moved = moveEmailToMailbox(emailId, getActionMailbox("archive"), getAppDatabase());
+
+    if (!moved) {
+      throw new Error(`Email ${emailId} was not found.`);
+    }
+
+    publishMailboxUpdated();
+    return true;
+  });
+
+  ipcMain.handle("mail:mark-email-read", (_event, emailId: number, isRead: boolean) => {
+    assertPositiveInteger(emailId, "email id");
+
+    if (typeof isRead !== "boolean") {
+      throw new Error("Read state must be a boolean.");
+    }
+
+    const updated = updateEmailReadState(emailId, isRead, getAppDatabase());
+
+    if (!updated) {
+      throw new Error(`Email ${emailId} was not found.`);
+    }
+
+    publishMailboxUpdated();
+    return true;
   });
 
   ipcMain.handle("mail:select-attachments", async () => {
@@ -349,24 +417,59 @@ function registerIpcHandlers(): void {
       draft.attachments = attachments;
     }
 
-    const result = await sendEmail({
-      smtp: {
-        host: account.smtpHost,
-        port: account.smtpPort,
-        secure: account.smtpPort === 465,
-        auth: {
-          user: account.emailAddress,
-          pass: decryptAccountPassword(account.appPassword),
+    try {
+      const sendOptions = {
+        smtp: {
+          host: account.smtpHost,
+          port: account.smtpPort,
+          secure: account.smtpPort === 465,
+          auth: {
+            user: account.emailAddress,
+            pass: decryptAccountPassword(account.appPassword),
+          },
         },
-      },
-      draft,
-      useUnsyncShield: input.useUnsyncShield,
-      database: getAppDatabase(),
-    });
+        draft,
+        useUnsyncShield: input.useUnsyncShield,
+        database: getAppDatabase(),
+      };
 
-    return {
-      shielded: result.shielded,
-    };
+      if (process.env.UNSYNC_PORTAL_API_URL) {
+        Object.assign(sendOptions, {
+          portalApiBaseUrl: process.env.UNSYNC_PORTAL_API_URL,
+        });
+      }
+
+      const result = await sendEmail(sendOptions);
+
+      return {
+        ok: true,
+        shielded: result.shielded,
+        deliveryMode: result.deliveryMode,
+        portal: result.portal,
+      };
+    } catch (error) {
+      if (isSendEmailError(error)) {
+        const responseError: {
+          code: typeof error.code;
+          message: string;
+          recipientEmail?: string;
+        } = {
+          code: error.code,
+          message: error.message,
+        };
+
+        if (error.recipientEmail) {
+          responseError.recipientEmail = error.recipientEmail;
+        }
+
+        return {
+          ok: false,
+          error: responseError,
+        };
+      }
+
+      throw error;
+    }
   });
 }
 
@@ -417,6 +520,122 @@ async function syncInboxForAccount(
     });
     throw error;
   }
+}
+
+async function syncInboxForAccounts(
+  accounts: StoredMailAccount[],
+  source: "manual" | "auto",
+  searchCriteria: unknown[],
+): Promise<SyncStatusEvent> {
+  if (syncInProgress) {
+    const status: SyncStatusEvent = {
+      state: "syncing",
+      message: "Sync already in progress. Mailbox will update when it finishes.",
+    };
+
+    if (source === "manual") {
+      publishSyncStatus(status);
+    }
+
+    return status;
+  }
+
+  syncInProgress = true;
+
+  try {
+    let totalFetched = 0;
+    let totalSaved = 0;
+    let totalEncrypted = 0;
+    let syncedAccounts = 0;
+    const failures: string[] = [];
+
+    for (const account of accounts) {
+      try {
+        const result = await syncInboxForAccount(account, searchCriteria);
+        totalFetched += result.fetched;
+        totalSaved += result.saved;
+        totalEncrypted += result.encrypted;
+        syncedAccounts += 1;
+      } catch (error) {
+        failures.push(`${account.emailAddress}: ${formatErrorMessage(error)}`);
+      }
+    }
+
+    if (syncedAccounts > 0) {
+      publishMailboxUpdated();
+    }
+
+    const status: SyncStatusEvent = failures.length === 0
+      ? {
+          state: "synced",
+          message: source === "auto"
+            ? `Synced ${totalSaved} new message${totalSaved === 1 ? "" : "s"}.`
+            : `Inbox synced. Saved ${totalSaved} new message${totalSaved === 1 ? "" : "s"}.`,
+          fetched: totalFetched,
+          saved: totalSaved,
+          encrypted: totalEncrypted,
+        }
+      : {
+          state: "error",
+          message: syncedAccounts > 0
+            ? `Synced ${totalSaved} new message${totalSaved === 1 ? "" : "s"}; ${failures.length} account${failures.length === 1 ? "" : "s"} failed.`
+            : `Sync failed. Will retry on the next interval. ${failures[0] ?? ""}`.trim(),
+          fetched: totalFetched,
+          saved: totalSaved,
+          encrypted: totalEncrypted,
+        };
+
+    publishSyncStatus(status);
+    return status;
+  } finally {
+    syncInProgress = false;
+  }
+}
+
+function startAutoSyncLoop(): void {
+  if (autoSyncTimer) {
+    return;
+  }
+
+  autoSyncTimer = setInterval(() => {
+    void runAutoSyncTick();
+  }, AUTO_SYNC_INTERVAL_MS);
+
+  void runAutoSyncTick();
+}
+
+function stopAutoSyncLoop(): void {
+  if (!autoSyncTimer) {
+    return;
+  }
+
+  clearInterval(autoSyncTimer);
+  autoSyncTimer = undefined;
+}
+
+async function runAutoSyncTick(): Promise<void> {
+  if (syncInProgress) {
+    return;
+  }
+
+  try {
+    const accounts = listMailAccounts(getAppDatabase());
+
+    if (accounts.length === 0) {
+      return;
+    }
+
+    await syncInboxForAccounts(accounts, "auto", getRecentInboxCriteria());
+  } catch (error) {
+    publishSyncStatus({
+      state: "error",
+      message: `Auto-sync could not run. Will retry soon. ${formatErrorMessage(error)}`,
+    });
+  }
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function encryptAccountPassword(value: string): string {
@@ -590,51 +809,96 @@ function toMailboxKey(folderName: string): string {
   const normalized = folderName.trim().toLowerCase();
   const mailboxMap: Record<string, string> = {
     inbox: "inbox",
-    "junk email": "junk",
-    drafts: "drafts",
+    sent: "sent",
     "sent items": "sent",
-    "deleted items": "deleted",
-    archive: "archive",
-    "conversation history": "conversation history",
-    notes: "notes",
     outbox: "outbox",
-    "go to groups": "groups",
+    drafts: "drafts",
+    archive: "archive",
+    spam: "spam",
+    junk: "spam",
+    "junk email": "spam",
+    trash: "trash",
+    deleted: "trash",
+    "deleted items": "trash",
   };
 
   return mailboxMap[normalized] ?? normalized;
 }
 
+const folderAliases: Record<string, string[]> = {
+  inbox: ["Inbox", "INBOX"],
+  sent: ["Sent", "Sent Items", "Sent Mail", "[Gmail]/Sent Mail", "[Google Mail]/Sent Mail"],
+  outbox: ["Outbox"],
+  drafts: ["Drafts", "[Gmail]/Drafts", "[Google Mail]/Drafts"],
+  archive: ["Archive", "All Mail", "[Gmail]/All Mail", "[Google Mail]/All Mail"],
+  spam: ["Spam", "Junk", "Junk Email", "[Gmail]/Spam", "[Google Mail]/Spam"],
+  trash: ["Trash", "Deleted Items", "Deleted Messages", "[Gmail]/Trash", "[Google Mail]/Trash"],
+};
+
+function getMailboxAliases(folderName: string): string[] {
+  const mailboxKey = toMailboxKey(folderName);
+  const aliases = folderAliases[mailboxKey] ?? [mailboxKey];
+  return Array.from(new Set([mailboxKey, ...aliases].map((alias) => alias.trim().toLowerCase())));
+}
+
+function getActionMailbox(folderKey: string): string {
+  const mailboxKey = toMailboxKey(folderKey);
+  const actionMailboxes: Record<string, string> = {
+    trash: "trash",
+    spam: "spam",
+    archive: "archive",
+  };
+
+  const mailbox = actionMailboxes[mailboxKey];
+
+  if (!mailbox) {
+    throw new Error(`Unsupported mailbox action: ${folderKey}`);
+  }
+
+  return mailbox;
+}
+
 function getFolderEmails(
   folderName: string,
   accountEmail: string | undefined,
+  query: string | undefined,
   db: DatabaseConnection,
 ) {
-  const mailbox = toMailboxKey(folderName);
+  const aliases = getMailboxAliases(folderName);
   const account = accountEmail ?? null;
+  const placeholders = aliases.map(() => "?").join(", ");
+  const baseParams = [...aliases, account];
+  const ftsQuery = query ? toFtsPrefixQuery(query) : "";
 
-  if (mailbox === "outbox") {
+  if (query && !ftsQuery) {
+    return [];
+  }
+
+  if (ftsQuery) {
     return db
-      .prepare<{ account: string | null }, FolderEmailRow>(`
+      .prepare<unknown[], FolderEmailRow>(`
         SELECT
-          id,
-          mailbox,
-          subject,
-          from_address AS fromAddress,
-          from_name AS fromName,
-          received_at AS receivedAt,
-          decrypted_preview AS decryptedPreview,
-          is_unsync_encrypted AS isUnsyncEncrypted
-        FROM emails
-        WHERE mailbox IN ('outbox', 'drafts')
-          AND (@account IS NULL OR account_id = @account)
-        ORDER BY COALESCE(sent_at, received_at) DESC, id DESC
+          emails.id,
+          emails.mailbox,
+          emails.subject,
+          emails.from_address AS fromAddress,
+          emails.from_name AS fromName,
+          emails.received_at AS receivedAt,
+          emails.decrypted_preview AS decryptedPreview,
+          emails.is_unsync_encrypted AS isUnsyncEncrypted
+        FROM email_fts
+        JOIN emails ON emails.id = email_fts.rowid
+        WHERE email_fts MATCH ?
+          AND lower(emails.mailbox) IN (${placeholders})
+          AND (? IS NULL OR emails.account_id = ?)
+        ORDER BY bm25(email_fts), COALESCE(emails.sent_at, emails.received_at) DESC, emails.id DESC
         LIMIT 50
       `)
-      .all({ account });
+      .all([ftsQuery, ...baseParams, account]);
   }
 
   return db
-    .prepare<{ mailbox: string; account: string | null }, FolderEmailRow>(`
+    .prepare<unknown[], FolderEmailRow>(`
       SELECT
         id,
         mailbox,
@@ -645,12 +909,22 @@ function getFolderEmails(
         decrypted_preview AS decryptedPreview,
         is_unsync_encrypted AS isUnsyncEncrypted
       FROM emails
-      WHERE mailbox = @mailbox
-        AND (@account IS NULL OR account_id = @account)
+      WHERE lower(mailbox) IN (${placeholders})
+        AND (? IS NULL OR account_id = ?)
       ORDER BY COALESCE(sent_at, received_at) DESC, id DESC
       LIMIT 50
     `)
-    .all({ mailbox, account });
+    .all([...baseParams, account]);
+}
+
+function toFtsPrefixQuery(query: string): string {
+  return query
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.replace(/"/g, '""').trim())
+    .filter((token) => token.length > 0)
+    .map((token) => `"${token}"*`)
+    .join(" ");
 }
 
 interface FolderEmailRow {
@@ -698,6 +972,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopAutoSyncLoop();
   database?.close();
   database = undefined;
 });

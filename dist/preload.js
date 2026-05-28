@@ -5,8 +5,8 @@ const api = {
     listEmails(options) {
         return electron_1.ipcRenderer.invoke("emails:list", options);
     },
-    getFolderEmails(folderName, accountEmail) {
-        return electron_1.ipcRenderer.invoke("mail:get-folder-emails", folderName, accountEmail);
+    getFolderEmails(folderName, accountEmail, query) {
+        return electron_1.ipcRenderer.invoke("mail:get-folder-emails", folderName, accountEmail, query);
     },
     getEmail(id) {
         return electron_1.ipcRenderer.invoke("emails:get", id);
@@ -40,6 +40,21 @@ const api = {
     },
     setReaderContent(html) {
         return electron_1.ipcRenderer.invoke("mail:set-reader-content", html);
+    },
+    moveEmailToFolder(emailId, folderKey) {
+        return electron_1.ipcRenderer.invoke("mail:move-email", emailId, folderKey);
+    },
+    deleteEmailToTrash(emailId) {
+        return electron_1.ipcRenderer.invoke("mail:delete-email-to-trash", emailId);
+    },
+    reportEmailSpam(emailId) {
+        return electron_1.ipcRenderer.invoke("mail:report-email-spam", emailId);
+    },
+    archiveEmail(emailId) {
+        return electron_1.ipcRenderer.invoke("mail:archive-email", emailId);
+    },
+    markEmailRead(emailId, isRead) {
+        return electron_1.ipcRenderer.invoke("mail:mark-email-read", emailId, isRead);
     },
     onMailboxUpdated(callback) {
         const listener = () => callback();

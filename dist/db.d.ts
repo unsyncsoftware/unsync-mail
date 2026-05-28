@@ -74,10 +74,27 @@ export interface SaveEmailInput {
     headersJson?: string;
     flagsJson?: string;
     isUnsyncEncrypted?: boolean;
+    deliveryMode?: "standard" | "unsync_direct" | "secure_portal";
+    securePortalId?: string;
+    securePortalUrl?: string;
 }
 export interface SavedEmail {
     id: number;
     isUnsyncEncrypted: 0 | 1;
+}
+export interface SaveSecurePortalPayloadInput {
+    portalId: string;
+    accessToken: string;
+    senderAccountId: string;
+    recipientEmail: string;
+    encryptedPayload: string;
+    portalUrl: string;
+    createdAt: string;
+    expiresAt: string;
+    idleTimeoutSeconds: number;
+    isConsumed?: boolean;
+    oneTimeRead?: boolean;
+    lastAccessAt?: string | null;
 }
 export interface SaveContactPublicKeyInput {
     emailAddress: string;
@@ -112,9 +129,12 @@ export declare function initializeSchema(database: DatabaseConnection): void;
 export declare function searchEmails(query: string, options?: EmailSearchOptions, database?: DatabaseConnection): EmailSearchResult[];
 export declare function listEmails(options?: EmailSearchOptions, database?: DatabaseConnection): EmailListItem[];
 export declare function getEmailById(id: number, database?: DatabaseConnection): EmailReadModel | undefined;
+export declare function moveEmailToMailbox(id: number, mailbox: string, database?: DatabaseConnection): boolean;
+export declare function updateEmailReadState(id: number, isRead: boolean, database?: DatabaseConnection): boolean;
 export declare function saveUserKey(input: SaveUserKeyInput, database?: DatabaseConnection): StoredUserKey;
 export declare function getActiveUserKey(userId: string, database?: DatabaseConnection): StoredUserKey | undefined;
 export declare function saveEmail(input: SaveEmailInput, database?: DatabaseConnection): SavedEmail;
+export declare function saveSecurePortalPayload(input: SaveSecurePortalPayloadInput, database?: DatabaseConnection): void;
 export declare function getContactPublicKey(emailAddress: string, database?: DatabaseConnection): string | undefined;
 export declare function saveContactPublicKey(input: SaveContactPublicKeyInput, database?: DatabaseConnection): void;
 export declare function saveMailAccount(input: SaveMailAccountInput, database?: DatabaseConnection): StoredMailAccount;

@@ -7,9 +7,12 @@ const db_1 = require("./db");
 const sync_1 = require("./sync");
 const DEFAULT_UI_USER_ID = "local-user";
 const SAFE_STORAGE_PREFIX = "safe:v1:";
+const AUTO_SYNC_INTERVAL_MS = 3 * 60 * 1000;
 let mainWindow;
 let database;
 let currentEmailHtml = "";
+let autoSyncTimer;
+let syncInProgress = false;
 electron_1.protocol.registerSchemesAsPrivileged([
     {
         scheme: "email-reader",
@@ -40,6 +43,13 @@ function createMainWindow() {
     });
     mainWindow.loadFile(path.join(__dirname, "..", "public", "index.html"));
     mainWindow.webContents.openDevTools({ mode: "detach" });
+    mainWindow.webContents.once("did-finish-load", () => {
+        startAutoSyncLoop();
+    });
+    mainWindow.once("closed", () => {
+        stopAutoSyncLoop();
+        mainWindow = undefined;
+    });
 }
 function getPlatformWindowChrome() {
     if (process.platform === "linux") {
@@ -148,15 +158,7 @@ function registerIpcHandlers() {
             ...input,
             appPassword,
         }, db);
-        const syncResult = await syncInboxForAccount(account, ["ALL"]);
-        publishSyncStatus({
-            state: "synced",
-            message: `Inbox synced. Saved ${syncResult.saved} message(s).`,
-            fetched: syncResult.fetched,
-            saved: syncResult.saved,
-            encrypted: syncResult.encrypted,
-        });
-        publishMailboxUpdated();
+        await syncInboxForAccounts([account], "manual", ["ALL"]);
         return (0, db_1.listMailAccounts)(db).map(toRendererAccount);
     });
     electron_1.ipcMain.handle("mail:sync-now", async (_event, accountEmail) => {
@@ -167,38 +169,75 @@ function registerIpcHandlers() {
         if (accountsToSync.length === 0) {
             throw new Error("No mail account is configured.");
         }
-        let totalFetched = 0;
-        let totalSaved = 0;
-        let totalEncrypted = 0;
-        for (const account of accountsToSync) {
-            const result = await syncInboxForAccount(account, getRecentInboxCriteria());
-            totalFetched += result.fetched;
-            totalSaved += result.saved;
-            totalEncrypted += result.encrypted;
-        }
-        const status = {
-            state: "synced",
-            message: `Inbox synced. Saved ${totalSaved} new/updated message(s).`,
-            fetched: totalFetched,
-            saved: totalSaved,
-            encrypted: totalEncrypted,
-        };
-        publishSyncStatus(status);
-        publishMailboxUpdated();
-        return status;
+        return syncInboxForAccounts(accountsToSync, "manual", getRecentInboxCriteria());
     });
     electron_1.ipcMain.handle("mail:set-reader-content", async (_event, html) => {
         currentEmailHtml = html || "";
         return true;
     });
-    electron_1.ipcMain.handle("mail:get-folder-emails", (_event, folderName, accountEmail) => {
+    electron_1.ipcMain.handle("mail:get-folder-emails", (_event, folderName, accountEmail, query) => {
         if (typeof folderName !== "string" || !folderName.trim()) {
             throw new Error("Folder name is required.");
         }
         if (accountEmail !== undefined && typeof accountEmail !== "string") {
             throw new Error("Account filter must be text.");
         }
-        return getFolderEmails(folderName, accountEmail?.trim() || undefined, getAppDatabase());
+        if (query !== undefined && typeof query !== "string") {
+            throw new Error("Search query must be text.");
+        }
+        return getFolderEmails(folderName, accountEmail?.trim() || undefined, query?.trim() || undefined, getAppDatabase());
+    });
+    electron_1.ipcMain.handle("mail:move-email", (_event, emailId, folderKey) => {
+        assertPositiveInteger(emailId, "email id");
+        if (typeof folderKey !== "string" || !folderKey.trim()) {
+            throw new Error("Folder key is required.");
+        }
+        const mailbox = getActionMailbox(folderKey);
+        const moved = (0, db_1.moveEmailToMailbox)(emailId, mailbox, getAppDatabase());
+        if (!moved) {
+            throw new Error(`Email ${emailId} was not found.`);
+        }
+        publishMailboxUpdated();
+        return true;
+    });
+    electron_1.ipcMain.handle("mail:delete-email-to-trash", (_event, emailId) => {
+        assertPositiveInteger(emailId, "email id");
+        const moved = (0, db_1.moveEmailToMailbox)(emailId, getActionMailbox("trash"), getAppDatabase());
+        if (!moved) {
+            throw new Error(`Email ${emailId} was not found.`);
+        }
+        publishMailboxUpdated();
+        return true;
+    });
+    electron_1.ipcMain.handle("mail:report-email-spam", (_event, emailId) => {
+        assertPositiveInteger(emailId, "email id");
+        const moved = (0, db_1.moveEmailToMailbox)(emailId, getActionMailbox("spam"), getAppDatabase());
+        if (!moved) {
+            throw new Error(`Email ${emailId} was not found.`);
+        }
+        publishMailboxUpdated();
+        return true;
+    });
+    electron_1.ipcMain.handle("mail:archive-email", (_event, emailId) => {
+        assertPositiveInteger(emailId, "email id");
+        const moved = (0, db_1.moveEmailToMailbox)(emailId, getActionMailbox("archive"), getAppDatabase());
+        if (!moved) {
+            throw new Error(`Email ${emailId} was not found.`);
+        }
+        publishMailboxUpdated();
+        return true;
+    });
+    electron_1.ipcMain.handle("mail:mark-email-read", (_event, emailId, isRead) => {
+        assertPositiveInteger(emailId, "email id");
+        if (typeof isRead !== "boolean") {
+            throw new Error("Read state must be a boolean.");
+        }
+        const updated = (0, db_1.updateEmailReadState)(emailId, isRead, getAppDatabase());
+        if (!updated) {
+            throw new Error(`Email ${emailId} was not found.`);
+        }
+        publishMailboxUpdated();
+        return true;
     });
     electron_1.ipcMain.handle("mail:select-attachments", async () => {
         const result = await electron_1.dialog.showOpenDialog(mainWindow, {
@@ -238,23 +277,50 @@ function registerIpcHandlers() {
         if (attachments.length > 0) {
             draft.attachments = attachments;
         }
-        const result = await (0, sync_1.sendEmail)({
-            smtp: {
-                host: account.smtpHost,
-                port: account.smtpPort,
-                secure: account.smtpPort === 465,
-                auth: {
-                    user: account.emailAddress,
-                    pass: decryptAccountPassword(account.appPassword),
+        try {
+            const sendOptions = {
+                smtp: {
+                    host: account.smtpHost,
+                    port: account.smtpPort,
+                    secure: account.smtpPort === 465,
+                    auth: {
+                        user: account.emailAddress,
+                        pass: decryptAccountPassword(account.appPassword),
+                    },
                 },
-            },
-            draft,
-            useUnsyncShield: input.useUnsyncShield,
-            database: getAppDatabase(),
-        });
-        return {
-            shielded: result.shielded,
-        };
+                draft,
+                useUnsyncShield: input.useUnsyncShield,
+                database: getAppDatabase(),
+            };
+            if (process.env.UNSYNC_PORTAL_API_URL) {
+                Object.assign(sendOptions, {
+                    portalApiBaseUrl: process.env.UNSYNC_PORTAL_API_URL,
+                });
+            }
+            const result = await (0, sync_1.sendEmail)(sendOptions);
+            return {
+                ok: true,
+                shielded: result.shielded,
+                deliveryMode: result.deliveryMode,
+                portal: result.portal,
+            };
+        }
+        catch (error) {
+            if ((0, sync_1.isSendEmailError)(error)) {
+                const responseError = {
+                    code: error.code,
+                    message: error.message,
+                };
+                if (error.recipientEmail) {
+                    responseError.recipientEmail = error.recipientEmail;
+                }
+                return {
+                    ok: false,
+                    error: responseError,
+                };
+            }
+            throw error;
+        }
     });
 }
 function toRendererAccount(account) {
@@ -299,6 +365,102 @@ async function syncInboxForAccount(account, searchCriteria) {
         });
         throw error;
     }
+}
+async function syncInboxForAccounts(accounts, source, searchCriteria) {
+    if (syncInProgress) {
+        const status = {
+            state: "syncing",
+            message: "Sync already in progress. Mailbox will update when it finishes.",
+        };
+        if (source === "manual") {
+            publishSyncStatus(status);
+        }
+        return status;
+    }
+    syncInProgress = true;
+    try {
+        let totalFetched = 0;
+        let totalSaved = 0;
+        let totalEncrypted = 0;
+        let syncedAccounts = 0;
+        const failures = [];
+        for (const account of accounts) {
+            try {
+                const result = await syncInboxForAccount(account, searchCriteria);
+                totalFetched += result.fetched;
+                totalSaved += result.saved;
+                totalEncrypted += result.encrypted;
+                syncedAccounts += 1;
+            }
+            catch (error) {
+                failures.push(`${account.emailAddress}: ${formatErrorMessage(error)}`);
+            }
+        }
+        if (syncedAccounts > 0) {
+            publishMailboxUpdated();
+        }
+        const status = failures.length === 0
+            ? {
+                state: "synced",
+                message: source === "auto"
+                    ? `Synced ${totalSaved} new message${totalSaved === 1 ? "" : "s"}.`
+                    : `Inbox synced. Saved ${totalSaved} new message${totalSaved === 1 ? "" : "s"}.`,
+                fetched: totalFetched,
+                saved: totalSaved,
+                encrypted: totalEncrypted,
+            }
+            : {
+                state: "error",
+                message: syncedAccounts > 0
+                    ? `Synced ${totalSaved} new message${totalSaved === 1 ? "" : "s"}; ${failures.length} account${failures.length === 1 ? "" : "s"} failed.`
+                    : `Sync failed. Will retry on the next interval. ${failures[0] ?? ""}`.trim(),
+                fetched: totalFetched,
+                saved: totalSaved,
+                encrypted: totalEncrypted,
+            };
+        publishSyncStatus(status);
+        return status;
+    }
+    finally {
+        syncInProgress = false;
+    }
+}
+function startAutoSyncLoop() {
+    if (autoSyncTimer) {
+        return;
+    }
+    autoSyncTimer = setInterval(() => {
+        void runAutoSyncTick();
+    }, AUTO_SYNC_INTERVAL_MS);
+    void runAutoSyncTick();
+}
+function stopAutoSyncLoop() {
+    if (!autoSyncTimer) {
+        return;
+    }
+    clearInterval(autoSyncTimer);
+    autoSyncTimer = undefined;
+}
+async function runAutoSyncTick() {
+    if (syncInProgress) {
+        return;
+    }
+    try {
+        const accounts = (0, db_1.listMailAccounts)(getAppDatabase());
+        if (accounts.length === 0) {
+            return;
+        }
+        await syncInboxForAccounts(accounts, "auto", getRecentInboxCriteria());
+    }
+    catch (error) {
+        publishSyncStatus({
+            state: "error",
+            message: `Auto-sync could not run. Will retry soon. ${formatErrorMessage(error)}`,
+        });
+    }
+}
+function formatErrorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
 }
 function encryptAccountPassword(value) {
     if (!electron_1.safeStorage.isEncryptionAvailable()) {
@@ -418,40 +580,77 @@ function toMailboxKey(folderName) {
     const normalized = folderName.trim().toLowerCase();
     const mailboxMap = {
         inbox: "inbox",
-        "junk email": "junk",
-        drafts: "drafts",
+        sent: "sent",
         "sent items": "sent",
-        "deleted items": "deleted",
-        archive: "archive",
-        "conversation history": "conversation history",
-        notes: "notes",
         outbox: "outbox",
-        "go to groups": "groups",
+        drafts: "drafts",
+        archive: "archive",
+        spam: "spam",
+        junk: "spam",
+        "junk email": "spam",
+        trash: "trash",
+        deleted: "trash",
+        "deleted items": "trash",
     };
     return mailboxMap[normalized] ?? normalized;
 }
-function getFolderEmails(folderName, accountEmail, db) {
-    const mailbox = toMailboxKey(folderName);
+const folderAliases = {
+    inbox: ["Inbox", "INBOX"],
+    sent: ["Sent", "Sent Items", "Sent Mail", "[Gmail]/Sent Mail", "[Google Mail]/Sent Mail"],
+    outbox: ["Outbox"],
+    drafts: ["Drafts", "[Gmail]/Drafts", "[Google Mail]/Drafts"],
+    archive: ["Archive", "All Mail", "[Gmail]/All Mail", "[Google Mail]/All Mail"],
+    spam: ["Spam", "Junk", "Junk Email", "[Gmail]/Spam", "[Google Mail]/Spam"],
+    trash: ["Trash", "Deleted Items", "Deleted Messages", "[Gmail]/Trash", "[Google Mail]/Trash"],
+};
+function getMailboxAliases(folderName) {
+    const mailboxKey = toMailboxKey(folderName);
+    const aliases = folderAliases[mailboxKey] ?? [mailboxKey];
+    return Array.from(new Set([mailboxKey, ...aliases].map((alias) => alias.trim().toLowerCase())));
+}
+function getActionMailbox(folderKey) {
+    const mailboxKey = toMailboxKey(folderKey);
+    const actionMailboxes = {
+        trash: "trash",
+        spam: "spam",
+        archive: "archive",
+    };
+    const mailbox = actionMailboxes[mailboxKey];
+    if (!mailbox) {
+        throw new Error(`Unsupported mailbox action: ${folderKey}`);
+    }
+    return mailbox;
+}
+function getFolderEmails(folderName, accountEmail, query, db) {
+    const aliases = getMailboxAliases(folderName);
     const account = accountEmail ?? null;
-    if (mailbox === "outbox") {
+    const placeholders = aliases.map(() => "?").join(", ");
+    const baseParams = [...aliases, account];
+    const ftsQuery = query ? toFtsPrefixQuery(query) : "";
+    if (query && !ftsQuery) {
+        return [];
+    }
+    if (ftsQuery) {
         return db
             .prepare(`
         SELECT
-          id,
-          mailbox,
-          subject,
-          from_address AS fromAddress,
-          from_name AS fromName,
-          received_at AS receivedAt,
-          decrypted_preview AS decryptedPreview,
-          is_unsync_encrypted AS isUnsyncEncrypted
-        FROM emails
-        WHERE mailbox IN ('outbox', 'drafts')
-          AND (@account IS NULL OR account_id = @account)
-        ORDER BY COALESCE(sent_at, received_at) DESC, id DESC
+          emails.id,
+          emails.mailbox,
+          emails.subject,
+          emails.from_address AS fromAddress,
+          emails.from_name AS fromName,
+          emails.received_at AS receivedAt,
+          emails.decrypted_preview AS decryptedPreview,
+          emails.is_unsync_encrypted AS isUnsyncEncrypted
+        FROM email_fts
+        JOIN emails ON emails.id = email_fts.rowid
+        WHERE email_fts MATCH ?
+          AND lower(emails.mailbox) IN (${placeholders})
+          AND (? IS NULL OR emails.account_id = ?)
+        ORDER BY bm25(email_fts), COALESCE(emails.sent_at, emails.received_at) DESC, emails.id DESC
         LIMIT 50
       `)
-            .all({ account });
+            .all([ftsQuery, ...baseParams, account]);
     }
     return db
         .prepare(`
@@ -465,12 +664,21 @@ function getFolderEmails(folderName, accountEmail, db) {
         decrypted_preview AS decryptedPreview,
         is_unsync_encrypted AS isUnsyncEncrypted
       FROM emails
-      WHERE mailbox = @mailbox
-        AND (@account IS NULL OR account_id = @account)
+      WHERE lower(mailbox) IN (${placeholders})
+        AND (? IS NULL OR account_id = ?)
       ORDER BY COALESCE(sent_at, received_at) DESC, id DESC
       LIMIT 50
     `)
-        .all({ mailbox, account });
+        .all([...baseParams, account]);
+}
+function toFtsPrefixQuery(query) {
+    return query
+        .trim()
+        .split(/\s+/)
+        .map((token) => token.replace(/"/g, '""').trim())
+        .filter((token) => token.length > 0)
+        .map((token) => `"${token}"*`)
+        .join(" ");
 }
 electron_1.app.whenReady().then(() => {
     electron_1.protocol.handle("email-reader", async (request) => {
@@ -499,6 +707,7 @@ electron_1.app.on("window-all-closed", () => {
     }
 });
 electron_1.app.on("before-quit", () => {
+    stopAutoSyncLoop();
     database?.close();
     database = undefined;
 });

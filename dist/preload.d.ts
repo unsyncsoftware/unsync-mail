@@ -52,6 +52,28 @@ export interface ComposeMailRequest {
     attachments?: MailAttachment[];
     useUnsyncShield: boolean;
 }
+export type SendMailResponse = {
+    ok: true;
+    shielded: boolean;
+    deliveryMode: "standard" | "unsync_direct" | "secure_portal";
+    portal?: SecurePortalSendInfo;
+} | {
+    ok: false;
+    error: ComposeSendError;
+};
+export interface SecurePortalSendInfo {
+    portalId: string;
+    portalUrl: string;
+    recipientEmail: string;
+    missingRecipientEmails: string[];
+    expiresAt: string;
+    idleTimeoutSeconds: number;
+}
+export interface ComposeSendError {
+    code: "MISSING_RECIPIENT_PUBLIC_KEY" | "SECURE_PORTAL_UPLOAD_FAILED";
+    recipientEmail?: string;
+    message: string;
+}
 export interface MailAttachment {
     filename: string;
     path: string;
@@ -62,7 +84,7 @@ declare const api: {
         mailbox?: string;
         query?: string;
     }): Promise<UnsyncEmailListItem[]>;
-    getFolderEmails(folderName: string, accountEmail?: string): Promise<UnsyncEmailListItem[]>;
+    getFolderEmails(folderName: string, accountEmail?: string, query?: string): Promise<UnsyncEmailListItem[]>;
     getEmail(id: number): Promise<UnsyncEmailReadModel>;
     decryptEmail(input: {
         id: number;
@@ -75,11 +97,14 @@ declare const api: {
     saveAccount(input: MailAccountSettings): Promise<MailAccountSettings[]>;
     deleteAccount(emailAddress: string): Promise<void>;
     syncNow(accountEmail?: string): Promise<SyncStatusEvent>;
-    sendMail(input: ComposeMailRequest): Promise<{
-        shielded: boolean;
-    }>;
+    sendMail(input: ComposeMailRequest): Promise<SendMailResponse>;
     selectAttachments(): Promise<MailAttachment[]>;
     setReaderContent(html: string): Promise<boolean>;
+    moveEmailToFolder(emailId: number, folderKey: string): Promise<boolean>;
+    deleteEmailToTrash(emailId: number): Promise<boolean>;
+    reportEmailSpam(emailId: number): Promise<boolean>;
+    archiveEmail(emailId: number): Promise<boolean>;
+    markEmailRead(emailId: number, isRead: boolean): Promise<boolean>;
     onMailboxUpdated(callback: () => void): () => Electron.IpcRenderer;
     onSyncStatus(callback: (event: SyncStatusEvent) => void): () => Electron.IpcRenderer;
 };

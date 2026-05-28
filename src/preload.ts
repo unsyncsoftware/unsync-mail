@@ -60,6 +60,30 @@ export interface ComposeMailRequest {
   useUnsyncShield: boolean;
 }
 
+export type SendMailResponse =
+  | {
+      ok: true;
+      shielded: boolean;
+      deliveryMode: "standard" | "unsync_direct" | "secure_portal";
+      portal?: SecurePortalSendInfo;
+    }
+  | { ok: false; error: ComposeSendError };
+
+export interface SecurePortalSendInfo {
+  portalId: string;
+  portalUrl: string;
+  recipientEmail: string;
+  missingRecipientEmails: string[];
+  expiresAt: string;
+  idleTimeoutSeconds: number;
+}
+
+export interface ComposeSendError {
+  code: "MISSING_RECIPIENT_PUBLIC_KEY" | "SECURE_PORTAL_UPLOAD_FAILED";
+  recipientEmail?: string;
+  message: string;
+}
+
 export interface MailAttachment {
   filename: string;
   path: string;
@@ -72,11 +96,12 @@ const api = {
     >;
   },
 
-  getFolderEmails(folderName: string, accountEmail?: string) {
+  getFolderEmails(folderName: string, accountEmail?: string, query?: string) {
     return ipcRenderer.invoke(
       "mail:get-folder-emails",
       folderName,
       accountEmail,
+      query,
     ) as Promise<UnsyncEmailListItem[]>;
   },
 
@@ -126,7 +151,7 @@ const api = {
   },
 
   sendMail(input: ComposeMailRequest) {
-    return ipcRenderer.invoke("mail:send", input) as Promise<{ shielded: boolean }>;
+    return ipcRenderer.invoke("mail:send", input) as Promise<SendMailResponse>;
   },
 
   selectAttachments() {
@@ -135,6 +160,26 @@ const api = {
 
   setReaderContent(html: string) {
     return ipcRenderer.invoke("mail:set-reader-content", html) as Promise<boolean>;
+  },
+
+  moveEmailToFolder(emailId: number, folderKey: string) {
+    return ipcRenderer.invoke("mail:move-email", emailId, folderKey) as Promise<boolean>;
+  },
+
+  deleteEmailToTrash(emailId: number) {
+    return ipcRenderer.invoke("mail:delete-email-to-trash", emailId) as Promise<boolean>;
+  },
+
+  reportEmailSpam(emailId: number) {
+    return ipcRenderer.invoke("mail:report-email-spam", emailId) as Promise<boolean>;
+  },
+
+  archiveEmail(emailId: number) {
+    return ipcRenderer.invoke("mail:archive-email", emailId) as Promise<boolean>;
+  },
+
+  markEmailRead(emailId: number, isRead: boolean) {
+    return ipcRenderer.invoke("mail:mark-email-read", emailId, isRead) as Promise<boolean>;
   },
 
   onMailboxUpdated(callback: () => void) {
