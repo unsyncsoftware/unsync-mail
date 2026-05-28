@@ -160,7 +160,7 @@ async function createSecurePortalPayload(draft, recipients, options = {}) {
         portalId,
         accessToken,
         recipients,
-        portalUrl: buildSecurePortalUrl(portalId),
+        portalUrl: buildSecurePortalUrl(portalId, accessToken),
         createdAt,
         expiresAt,
         idleTimeoutSeconds: SECURE_PORTAL_IDLE_TIMEOUT_SECONDS,
@@ -594,8 +594,9 @@ function randomToken(byteLength) {
         .randomBytes(byteLength)
         .toString("base64url");
 }
-function buildSecurePortalUrl(portalId) {
-    return `${SECURE_PORTAL_READER_BASE_URL.replace(/\/+$/, "")}/read/${encodeURIComponent(portalId)}`;
+function buildSecurePortalUrl(portalId, accessToken) {
+    const base = `${SECURE_PORTAL_READER_BASE_URL.replace(/\/+$/, "")}/read/${encodeURIComponent(portalId)}`;
+    return accessToken ? `${base}#${accessToken}` : base;
 }
 function deriveAccessTokenKey(accessToken) {
     return crypto.createHash("sha256").update(accessToken).digest();
