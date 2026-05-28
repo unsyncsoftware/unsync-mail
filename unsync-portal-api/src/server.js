@@ -276,7 +276,7 @@ async function handleOpsDashboard(request, response) {
   const snapshot = await buildSafeMetricsSnapshot();
   response.setHeader(
     "content-security-policy",
-    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "default-src 'none'; style-src 'nonce-unsync-ops-style'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
   );
   sendText(response, 200, "text/html; charset=utf-8", buildOpsDashboardHtml(snapshot));
 }
@@ -2085,7 +2085,7 @@ function buildOpsDashboardHtml(snapshot) {
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer">
     <title>Unsync Portal Ops</title>
-    <style>
+    <style nonce="unsync-ops-style">
       body { margin: 0; background: #070b10; color: #e6edf3; font-family: ui-sans-serif, system-ui, sans-serif; }
       main { max-width: 1180px; margin: 0 auto; padding: 32px 20px; }
       h1 { font-size: 24px; font-weight: 650; margin: 0 0 6px; }

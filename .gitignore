@@ -1,5 +1,33 @@
 node_modules/
-Dist/
+dist/
 out/
-*.log
+release/
+
+# Local environment and secrets
 .env
+.env.*
+*.env
+!*.env.example
+
+# Local mail/cache databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Runtime logs and process output
+*.log
+logs/
+*.out
+*.err
+
+# Portal runtime storage and staged encrypted chunks
+portal-storage/
+*.chunk
+unsync-portal-api/data/
+unsync-portal-api/logs/
+unsync-portal-api/.tmp*/
+unsync-portal-api/*.log
+unsync-portal-api/*.out
+unsync-portal-api/*.err

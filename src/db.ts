@@ -1,7 +1,7 @@
-import Database = require("better-sqlite3");
 import fs = require("node:fs");
 import os = require("node:os");
 import path = require("node:path");
+import { DatabaseSync } from "node:sqlite";
 
 export const DEFAULT_DATABASE_DIR =
   process.env.UNSYNC_MAIL_DATA_DIR ??
@@ -14,7 +14,25 @@ export const DEFAULT_DATABASE_PATH = path.join(
   "unsync-mail.sqlite",
 );
 
-export type DatabaseConnection = Database.Database;
+export interface DatabaseRunResult {
+  changes: number;
+  lastInsertRowid: number | bigint;
+}
+
+export interface DatabaseStatement<Params = unknown, Result = unknown> {
+  run(params?: Params): DatabaseRunResult;
+  get(params?: Params): Result | undefined;
+  all(params?: Params): Result[];
+}
+
+export interface DatabaseConnection {
+  readonly name: string;
+  close(): void;
+  exec(sql: string): void;
+  pragma(sql: string): unknown[];
+  prepare<Params = unknown, Result = unknown>(sql: string): DatabaseStatement<Params, Result>;
+  transaction<T>(fn: () => T): () => T;
+}
 
 export interface EmailSearchOptions {
   accountId?: string;
@@ -153,11 +171,96 @@ let activeDatabase: DatabaseConnection | undefined;
 export function openDatabase(databasePath = DEFAULT_DATABASE_PATH): DatabaseConnection {
   fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 
-  const database = new Database(databasePath);
+  const database = new UnsyncDatabase(databasePath);
   configureDatabase(database);
   initializeSchema(database);
 
   return database;
+}
+
+class UnsyncDatabase implements DatabaseConnection {
+  readonly name: string;
+  private readonly database: DatabaseSync;
+  private transactionDepth = 0;
+
+  constructor(databasePath: string) {
+    this.name = databasePath;
+    this.database = new DatabaseSync(databasePath);
+  }
+
+  close(): void {
+    this.database.close();
+  }
+
+  exec(sql: string): void {
+    this.database.exec(sql);
+  }
+
+  pragma(sql: string): unknown[] {
+    return this.database.prepare(`PRAGMA ${sql}`).all();
+  }
+
+  prepare<Params = unknown, Result = unknown>(sql: string): DatabaseStatement<Params, Result> {
+    const statement = this.database.prepare(sql);
+
+    statement.setAllowBareNamedParameters(true);
+
+    return {
+      run(params?: Params): DatabaseRunResult {
+        const result = statement.run(...toStatementArgs(params));
+
+        return {
+          changes: Number(result.changes),
+          lastInsertRowid: result.lastInsertRowid,
+        };
+      },
+      get(params?: Params): Result | undefined {
+        return statement.get(...toStatementArgs(params)) as Result | undefined;
+      },
+      all(params?: Params): Result[] {
+        return statement.all(...toStatementArgs(params)) as Result[];
+      },
+    };
+  }
+
+  transaction<T>(fn: () => T): () => T {
+    return () => {
+      const isRootTransaction = this.transactionDepth === 0;
+      const savepointName = `unsync_tx_${this.transactionDepth}`;
+
+      this.database.exec(isRootTransaction ? "BEGIN IMMEDIATE" : `SAVEPOINT ${savepointName}`);
+      this.transactionDepth += 1;
+
+      try {
+        const result = fn();
+
+        this.transactionDepth -= 1;
+        this.database.exec(isRootTransaction ? "COMMIT" : `RELEASE SAVEPOINT ${savepointName}`);
+
+        return result;
+      } catch (error) {
+        this.transactionDepth -= 1;
+        this.database.exec(
+          isRootTransaction
+            ? "ROLLBACK"
+            : `ROLLBACK TO SAVEPOINT ${savepointName}; RELEASE SAVEPOINT ${savepointName}`,
+        );
+        throw error;
+      }
+    };
+  }
+}
+
+function toStatementArgs(params: unknown): any[] {
+  if (params === undefined) {
+    return [];
+  }
+
+  if (Array.isArray(params)) {
+    return params;
+  }
+
+  return [params];
 }
 
 export function getDatabase(databasePath = DEFAULT_DATABASE_PATH): DatabaseConnection {

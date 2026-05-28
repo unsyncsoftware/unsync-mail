@@ -7,6 +7,7 @@ import {
   Menu,
   protocol,
   safeStorage,
+  shell,
 } from "electron";
 import path = require("node:path");
 
@@ -83,14 +84,23 @@ function createMainWindow(): void {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       preload: path.join(__dirname, "preload.js"),
     },
   });
 
   mainWindow.loadFile(path.join(__dirname, "..", "public", "index.html"));
 
-  mainWindow.webContents.openDevTools({ mode: "detach" });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    void openSafeExternalUrl(url);
+    return { action: "deny" };
+  });
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (url !== mainWindow?.webContents.getURL()) {
+      event.preventDefault();
+      void openSafeExternalUrl(url);
+    }
+  });
   mainWindow.webContents.once("did-finish-load", () => {
     startAutoSyncLoop();
   });
@@ -98,6 +108,20 @@ function createMainWindow(): void {
     stopAutoSyncLoop();
     mainWindow = undefined;
   });
+}
+
+async function openSafeExternalUrl(url: string): Promise<void> {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return;
+  }
+
+  if (["https:", "http:", "mailto:"].includes(parsedUrl.protocol)) {
+    await shell.openExternal(parsedUrl.toString());
+  }
 }
 
 function getPlatformWindowChrome(): Pick<
@@ -640,10 +664,11 @@ function formatErrorMessage(error: unknown): string {
 
 function encryptAccountPassword(value: string): string {
   if (!safeStorage.isEncryptionAvailable()) {
-    // Fallback keeps development builds working on platforms where the OS
-    // keychain is unavailable. Production builds should surface this as a
-    // warning and require safeStorage support.
-    return value;
+    if (process.env.UNSYNC_ALLOW_INSECURE_PASSWORD_STORAGE === "true") {
+      return value;
+    }
+
+    throw new Error("OS password storage is unavailable; refusing to save the app password without encryption.");
   }
 
   return `${SAFE_STORAGE_PREFIX}${safeStorage.encryptString(value).toString("base64")}`;
@@ -950,7 +975,7 @@ app.whenReady().then(() => {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Content-Security-Policy":
-          "default-src 'none'; style-src 'unsafe-inline'; img-src http: https: data: cid: blob:; font-src data:; base-uri 'none'; form-action 'none'; frame-src 'none'; script-src 'none';",
+          "default-src 'none'; style-src 'nonce-unsync-reader-style'; img-src http: https: data: cid: blob:; font-src data:; base-uri 'none'; form-action 'none'; frame-src 'none'; script-src 'none';",
       },
     });
   });

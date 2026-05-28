@@ -1,2 +1,16 @@
+.env
+.env.*
+*.env
+!*.env.example
+
+data/
+logs/
+portal-storage/
+*.chunk
+*.log
+*.out
+*.err
+.tmp*/
+
 .tmp-prod-start.err
 .tmp-prod-start.out

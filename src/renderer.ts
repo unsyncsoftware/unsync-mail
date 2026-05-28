@@ -1587,12 +1587,13 @@ function renderAttachmentList(): void {
 function buildReaderDocument(body: string, isHtml: boolean): string {
   const content = isHtml ? body : `<pre>${escapeHtml(body)}</pre>`;
   const emailBodyPayload = content;
+  const readerStyleNonce = "unsync-reader-style";
 
   return `<!DOCTYPE html>
 <html>
   <head>
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src http: https: data:;">
-    <style>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${readerStyleNonce}'; img-src http: https: data:;">
+    <style nonce="${readerStyleNonce}">
       html,
       body {
         margin: 0;
@@ -1624,7 +1625,7 @@ function sanitizeEmailHtml(html: string): string {
 
   doc
     .querySelectorAll(
-      'script, iframe, object, embed, form, input, button, link[rel="stylesheet"], meta[http-equiv]',
+      'script, style, iframe, object, embed, form, input, button, link[rel="stylesheet"], meta[http-equiv]',
     )
     .forEach((element) => element.remove());
 
@@ -1634,6 +1635,11 @@ function sanitizeEmailHtml(html: string): string {
       const attributeValue = attribute.value.trim().toLowerCase();
 
       if (attributeName.startsWith("on")) {
+        element.removeAttribute(attribute.name);
+        continue;
+      }
+
+      if (attributeName === "style") {
         element.removeAttribute(attribute.name);
         continue;
       }
