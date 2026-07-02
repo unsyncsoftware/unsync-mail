@@ -29,3 +29,17 @@ CREATE TABLE secure_portal_attachment_chunks (
   created_at TEXT NOT NULL,
   PRIMARY KEY (portal_id, attachment_id, chunk_index)
 );
+
+CREATE TABLE secure_portal_replies (
+  reply_id TEXT PRIMARY KEY,
+  portal_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  recipient_email_hash TEXT NOT NULL,
+  notification_email_hash TEXT NOT NULL,
+  encrypted_payload_json TEXT NOT NULL,
+  FOREIGN KEY (portal_id) REFERENCES secure_portal_payloads (portal_id)
+);
+
+CREATE INDEX idx_secure_portal_replies_portal_id
+  ON secure_portal_replies (portal_id);

@@ -18,6 +18,7 @@ const enableHsts = parseBoolean(process.env.PORTAL_ENABLE_HSTS ?? String(trustPr
 const maxBodyBytes = Number(process.env.PORTAL_MAX_BODY_BYTES ?? 524288);
 const maxJsonBodyBytes = Number(process.env.PORTAL_MAX_JSON_BODY_BYTES ?? maxBodyBytes);
 const maxAttachmentChunkBytes = Number(process.env.PORTAL_MAX_ATTACHMENT_CHUNK_BYTES ?? 1024 * 1024 + 4096);
+const maxReplyCiphertextBytes = Number(process.env.PORTAL_MAX_REPLY_CIPHERTEXT_BYTES ?? 256 * 1024);
 const otpTtlMs = 10 * 60 * 1000;
 const verifiedSessionTtlMs = 15 * 60 * 1000;
 const maxOtpAttempts = 5;
@@ -82,6 +83,7 @@ const metricsCounters = {
  * @property {string | null} consumedAt
  * @property {string | null} deleteAfter
  * @property {Array<{ attachmentId: string, chunkCount: number, encryptedSize: number, uploadComplete: boolean, receivedChunkCount: number, receivedEncryptedSize: number }>} attachments
+ * @property {Array<{ replyId: string, createdAt: string, receivedAt: string, recipientEmailHash: string, notificationEmailHash: string, encryptedPayload: object }>} replies
  * @property {string | null} lastAccessAt
  * @property {string} updatedAt
  */
@@ -237,6 +239,12 @@ async function handleRequest(request, response) {
     return;
   }
 
+  // Secure Reader browser replies. Body text is encrypted in the browser before this endpoint receives it.
+  if (request.method === "POST" && url.pathname === "/portal/reply") {
+    await handlePortalReply(request, response);
+    return;
+  }
+
   const portalMatch = url.pathname.match(/^\/portal\/([^/]+)$/);
 
   if (request.method === "GET" && portalMatch) {
@@ -316,6 +324,7 @@ async function handleCreate(request, response) {
     consumedAt: null,
     deleteAfter: null,
     attachments,
+    replies: [],
     lastAccessAt: null,
     updatedAt: new Date().toISOString()
   };
@@ -713,6 +722,71 @@ async function handleGetPortal(request, response, portalId, url) {
   sendJson(response, 200, responsePayload);
 }
 
+async function handlePortalReply(request, response) {
+  const body = await readJsonBody(request);
+  const validationError = validatePortalReplyBody(body);
+
+  if (validationError) {
+    sendJson(response, 400, { error: validationError });
+    return;
+  }
+
+  if (!consumeRequestRateLimit(request, response, "reply", body.portalId, portalRateLimitMax, {
+    reason: "reply_submit"
+  })) {
+    return;
+  }
+
+  const record = await getReplyablePortalRecord(response, body.portalId, { request });
+
+  if (!record) {
+    return;
+  }
+
+  const verifiedSession = getVerifiedSession(request, record);
+
+  if (!verifiedSession) {
+    logInvalidPortalAccess(request, body.portalId, "verified_session_required");
+    sendJson(response, 403, { error: "portal_access_denied" });
+    return;
+  }
+
+  const notificationEmail = normalizeEmail(body.notificationEmail);
+  const receivedAt = new Date().toISOString();
+  const reply = {
+    replyId: randomToken(18),
+    createdAt: body.encryptedPayload.createdAt,
+    receivedAt,
+    recipientEmailHash: hashLogValue(verifiedSession.recipientEmail),
+    notificationEmailHash: hashLogValue(notificationEmail),
+    encryptedPayload: body.encryptedPayload,
+  };
+
+  record.replies = Array.isArray(record.replies) ? record.replies : [];
+  record.replies.push(reply);
+  record.updatedAt = receivedAt;
+  await persistRecords();
+
+  const notificationSent = await sendReplyNotificationEmail(notificationEmail)
+    .catch(() => {
+      logSecurityEvent("reply_notification_failed", {
+        portalIdHash: hashLogValue(record.portalId),
+        recipientEmailHash: hashLogValue(verifiedSession.recipientEmail),
+        reason: "smtp_send_failed"
+      });
+      return false;
+    });
+
+  logSecurityEvent("portal_reply_stored", {
+    portalIdHash: hashLogValue(record.portalId),
+    recipientEmailHash: hashLogValue(verifiedSession.recipientEmail),
+    notificationSent,
+    replyCount: record.replies.length
+  });
+
+  sendJson(response, 201, { ok: true, replyId: reply.replyId, notificationSent });
+}
+
 function getAccessTokenHash(request) {
   return getHeaderValue(request.headers["x-unsync-access-token-hash"]);
 }
@@ -741,6 +815,31 @@ async function getActivePortalRecord(response, portalId, options = {}) {
 
   if (record.isConsumed || consumingPortals.has(portalId)) {
     sendJson(response, 410, { error: "PORTAL_CONSUMED" });
+    return undefined;
+  }
+
+  return record;
+}
+
+async function getReplyablePortalRecord(response, portalId, options = {}) {
+  const record = records.get(portalId);
+
+  if (!record) {
+    if (options.request) {
+      logInvalidPortalAccess(options.request, portalId, "missing_portal");
+    }
+    sendJson(response, 403, { error: "portal_access_denied" });
+    return undefined;
+  }
+
+  if (isExpired(record)) {
+    records.delete(portalId);
+    expirePortalAuthState(portalId);
+    await persistRecords();
+    if (options.request) {
+      logInvalidPortalAccess(options.request, portalId, "expired_portal");
+    }
+    sendJson(response, 403, { error: "portal_access_denied" });
     return undefined;
   }
 
@@ -1088,6 +1187,44 @@ function validateUploadSessionBody(body) {
   return undefined;
 }
 
+function validatePortalReplyBody(body) {
+  if (!isPlainObject(body)) return "invalid_body";
+  if (!isToken(body.portalId, 16, 256)) return "invalid_portal_id";
+  if (!isValidEmail(normalizeEmail(body.notificationEmail))) return "invalid_notification_email";
+  if (!isValidEncryptedReplyPayload(body.encryptedPayload)) return "invalid_encrypted_reply";
+  return undefined;
+}
+
+function isValidEncryptedReplyPayload(payload) {
+  if (!isPlainObject(payload)) return false;
+  if (payload.version !== 1) return false;
+  if (payload.type !== "portal-reply") return false;
+  if (payload.cipher !== "aes-256-gcm") return false;
+  if (!isIsoDate(payload.createdAt)) return false;
+  if (Date.parse(payload.createdAt) > Date.now() + 5 * 60 * 1000) return false;
+  if (!isPlainObject(payload.encryptedBody)) return false;
+
+  const { iv, ciphertext, authTag } = payload.encryptedBody;
+  return (
+    isBase64UrlBytes(iv, 12, 12) &&
+    isBase64UrlBytes(authTag, 16, 16) &&
+    isBase64UrlBytes(ciphertext, 1, maxReplyCiphertextBytes)
+  );
+}
+
+function isBase64UrlBytes(value, minBytes, maxBytes) {
+  if (typeof value !== "string" || value.length === 0 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    return false;
+  }
+
+  const byteLength = Buffer.from(
+    value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4),
+    "base64",
+  ).length;
+
+  return byteLength >= minBytes && byteLength <= maxBytes;
+}
+
 function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -1420,9 +1557,11 @@ function isSafeEventFieldName(key) {
     "reason",
     "attachmentCount",
     "recipientCount",
+    "replyCount",
     "expiresInMs",
     "oneTimeRead",
     "blocked",
+    "notificationSent",
     "deleteAfter",
   ].includes(key);
 }
@@ -1728,6 +1867,38 @@ async function sendOtpEmail(recipientEmail, otp) {
   await sendSmtpMail({ host, port: portValue, user, pass, from, to: recipientEmail, message });
 }
 
+async function sendReplyNotificationEmail(recipientEmail) {
+  const host = process.env.SMTP_HOST;
+  const portValue = Number(process.env.SMTP_PORT ?? 465);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM ?? user;
+
+  if (!host || !from) {
+    return false;
+  }
+
+  const subject = "Unsync Secure Portal Reply Received";
+  const body = [
+    "A Secure Portal reply was submitted.",
+    "",
+    "The reply body is stored encrypted and was not included in this notification.",
+  ].join("\r\n");
+  const message = [
+    `From: ${from}`,
+    `To: ${recipientEmail}`,
+    `Subject: ${subject}`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=utf-8",
+    "Content-Transfer-Encoding: 8bit",
+    "",
+    body,
+  ].join("\r\n");
+
+  await sendSmtpMail({ host, port: portValue, user, pass, from, to: recipientEmail, message });
+  return true;
+}
+
 async function sendSmtpMail(options) {
   const secure = process.env.SMTP_SECURE !== "false";
 
@@ -1804,7 +1975,13 @@ async function loadRecords() {
     const parsed = JSON.parse(raw);
 
     if (Array.isArray(parsed.records)) {
-      records = new Map(parsed.records.map((record) => [record.portalId, record]));
+      records = new Map(parsed.records.map((record) => [
+        record.portalId,
+        {
+          ...record,
+          replies: Array.isArray(record.replies) ? record.replies : [],
+        },
+      ]));
     }
   } catch (error) {
     if (error && error.code !== "ENOENT") {
@@ -2041,6 +2218,25 @@ function sendReaderPage(response, portalId) {
           </section>
         </article>
       </section>
+      <section id="reply-modal" class="reply-modal" role="dialog" aria-modal="true" aria-labelledby="reply-title" hidden>
+        <form id="reply-form" class="reply-panel" autocomplete="off">
+          <div class="reply-header">
+            <h2 id="reply-title">Secure reply</h2>
+            <button id="reply-close-button" class="reply-close" type="button" aria-label="Close reply composer">x</button>
+          </div>
+          <label for="reply-to">To</label>
+          <input id="reply-to" name="reply-to" type="email" readonly>
+          <label for="reply-subject">Subject</label>
+          <input id="reply-subject" name="reply-subject" type="text" readonly>
+          <label for="reply-body">Message</label>
+          <textarea id="reply-body" name="reply-body" rows="8" required></textarea>
+          <p id="reply-status" class="reply-status" role="status"></p>
+          <div class="reply-actions">
+            <button id="reply-cancel-button" type="button">Cancel</button>
+            <button id="reply-send-button" type="submit">Send encrypted reply</button>
+          </div>
+        </form>
+      </section>
     </main>
     <script src="/reader/reader.js"></script>
   </body>
@@ -2214,12 +2410,14 @@ label {
 }
 
 input,
+textarea,
 button {
   border-radius: 0;
   font: inherit;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   border: 1px solid #35404b;
   background: #07090c;
@@ -2228,7 +2426,13 @@ input {
   outline: none;
 }
 
-input:focus {
+textarea {
+  min-height: 160px;
+  resize: vertical;
+}
+
+input:focus,
+textarea:focus {
   border-color: #8ee6c8;
 }
 
@@ -2327,6 +2531,71 @@ button:disabled {
   margin-top: 2px;
 }
 
+.reply-modal {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(4, 7, 10, 0.78);
+}
+
+.reply-modal[hidden] {
+  display: none;
+}
+
+.reply-panel {
+  width: min(560px, 100%);
+  display: grid;
+  gap: 10px;
+  border: 1px solid #2d343d;
+  background: #11161c;
+  padding: 20px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+}
+
+.reply-header,
+.reply-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.reply-header h2 {
+  font-size: 20px;
+}
+
+.reply-close {
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  background: #161e27;
+  color: #e6edf3;
+  border-color: #3a4653;
+}
+
+.reply-status {
+  min-height: 20px;
+  color: #b7c0c9;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.reply-status.is-error {
+  color: #ff9b9b;
+}
+
+.reply-status.is-success {
+  color: #8ee6c8;
+}
+
+.reply-actions button:first-child {
+  background: #161e27;
+  color: #e6edf3;
+  border-color: #3a4653;
+}
+
 @media (max-width: 540px) {
   .message-toolbar {
     grid-template-columns: 1fr;
@@ -2338,6 +2607,10 @@ button:disabled {
 
   .message-actions button {
     flex: 1;
+  }
+
+  .reply-actions {
+    display: grid;
   }
 }
 `;
@@ -2365,14 +2638,24 @@ const readerJs = `
   const messageBody = document.getElementById("message-body");
   const attachmentSection = document.getElementById("attachment-section");
   const attachmentList = document.getElementById("attachment-list");
+  const replyModal = document.getElementById("reply-modal");
+  const replyForm = document.getElementById("reply-form");
+  const replyToInput = document.getElementById("reply-to");
+  const replySubjectInput = document.getElementById("reply-subject");
+  const replyBodyInput = document.getElementById("reply-body");
+  const replyStatus = document.getElementById("reply-status");
+  const replyCloseButton = document.getElementById("reply-close-button");
+  const replyCancelButton = document.getElementById("reply-cancel-button");
+  const replySendButton = document.getElementById("reply-send-button");
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
   let plaintextSubject = "";
   let plaintextBody = "";
   let decryptedMetadata = null;
-  let replyMailto = "";
-  let forwardMailto = "";
+  let replyTargetEmail = "";
+  let replyPreparedSubject = "";
+  let replyEncryptionKey = null;
   let attachmentDescriptors = [];
   let attachmentObjectUrls = [];
   let accessToken = "";
@@ -2387,11 +2670,17 @@ const readerJs = `
   });
 
   replyButton.addEventListener("click", () => {
-    openMailto(replyMailto);
+    openReplyComposer();
   });
   forwardButton.addEventListener("click", () => {
-    openMailto(forwardMailto);
+    setState("Forwarding is not available in Secure Reader.", "error");
   });
+  replyForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendSecureReply();
+  });
+  replyCloseButton.addEventListener("click", closeReplyComposer);
+  replyCancelButton.addEventListener("click", closeReplyComposer);
 
   window.addEventListener("beforeunload", clearPlaintext);
   window.addEventListener("pagehide", clearPlaintext);
@@ -2560,7 +2849,7 @@ const readerJs = `
 
       const tokenKey = await importAesKey(await sha256Bytes(accessToken));
       const messageKeyBytes = await decryptPart(encryptedPayload.wrappedMessageKey, tokenKey);
-      const messageKey = await importAesKey(messageKeyBytes);
+      const messageKey = await importAesKey(messageKeyBytes, ["decrypt", "encrypt"]);
       const metadataBytes = await decryptPart(encryptedPayload.encryptedMetadata, messageKey);
       const bodyBytes = await decryptPart(encryptedPayload.encryptedBody, messageKey);
       const metadata = JSON.parse(decoder.decode(metadataBytes));
@@ -2568,6 +2857,7 @@ const readerJs = `
       const attachments = await buildAttachmentDescriptors(metadata.attachments || [], messageKey);
 
       decryptedMetadata = metadata;
+      replyEncryptionKey = messageKey;
       attachmentDescriptors = attachments;
       plaintextSubject = String(metadata.subject || "(no subject)");
       plaintextBody = String(body.text || "");
@@ -2598,8 +2888,8 @@ const readerJs = `
     return toBase64Url(await sha256Bytes(value));
   }
 
-  async function importAesKey(rawKey) {
-    return crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, ["decrypt"]);
+  async function importAesKey(rawKey, usages = ["decrypt"]) {
+    return crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, usages);
   }
 
   async function decryptPart(part, key) {
@@ -2671,13 +2961,11 @@ const readerJs = `
   function prepareMessageActions(metadata, subject, body) {
     const sender = getOriginalSender(metadata);
     const replySubject = prefixSubject("Re:", subject);
-    const forwardSubject = prefixSubject("Fwd:", subject);
-    const quotedBody = buildQuotedBody(body);
 
-    replyMailto = buildMailto(sender, replySubject, quotedBody);
-    forwardMailto = buildMailto("", forwardSubject, quotedBody);
+    replyTargetEmail = sender;
+    replyPreparedSubject = replySubject;
     replyButton.disabled = !sender;
-    forwardButton.disabled = false;
+    forwardButton.disabled = true;
   }
 
   function showDecryptedSession(timeoutSeconds) {
@@ -2732,33 +3020,125 @@ const readerJs = `
       : prefix + " " + normalizedSubject;
   }
 
-  function buildQuotedBody(body) {
-    const text = String(body || "").trim();
-
-    if (!text) {
-      return "";
-    }
-
-    return "\\n\\n--- Original secure message ---\\n" + text.split("\\n").map((line) => "> " + line).join("\\n");
-  }
-
-  function buildMailto(to, subject, body) {
-    const params = new URLSearchParams();
-    params.set("subject", subject);
-
-    if (body) {
-      params.set("body", body);
-    }
-
-    return "mailto:" + encodeURIComponent(to || "") + "?" + params.toString();
-  }
-
-  function openMailto(url) {
-    if (!url) {
+  function openReplyComposer() {
+    if (!replyTargetEmail || !replyEncryptionKey || !verifiedSessionToken) {
+      setState("Reply is unavailable for this secure message.", "error");
       return;
     }
 
-    window.location.href = url;
+    replyToInput.value = replyTargetEmail;
+    replySubjectInput.value = replyPreparedSubject;
+    replyBodyInput.value = "";
+    setReplyStatus("", "");
+    replyModal.hidden = false;
+    replyBodyInput.focus();
+  }
+
+  function closeReplyComposer() {
+    replyModal.hidden = true;
+    replyBodyInput.value = "";
+    setReplyStatus("", "");
+    replySendButton.disabled = false;
+  }
+
+  async function sendSecureReply() {
+    const replyText = replyBodyInput.value.trim();
+
+    if (!replyText) {
+      setReplyStatus("Write a reply before sending.", "error");
+      return;
+    }
+
+    replySendButton.disabled = true;
+    setReplyStatus("Encrypting reply in this browser...", "");
+
+    try {
+      const encryptedPayload = await encryptReplyPayload({
+        to: replyTargetEmail,
+        subject: replyPreparedSubject,
+        text: replyText
+      });
+      setReplyStatus("Uploading encrypted reply...", "");
+
+      const response = await fetch("/portal/reply", {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          "content-type": "application/json",
+          "x-unsync-recipient-email": recipientEmail,
+          "x-unsync-verified-session": verifiedSessionToken
+        },
+        body: JSON.stringify({
+          portalId: portalIdInput.value,
+          notificationEmail: replyTargetEmail,
+          encryptedPayload
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(await friendlyReplyError(response));
+      }
+
+      const result = await response.json();
+      replyBodyInput.value = "";
+      setReplyStatus(
+        result.notificationSent
+          ? "Encrypted reply sent. The sender was notified."
+          : "Encrypted reply stored. Sender notification is not configured.",
+        "success"
+      );
+      setState("Encrypted reply submitted.", "success");
+    } catch (error) {
+      setReplyStatus(error instanceof Error ? error.message : "Unable to send encrypted reply.", "error");
+    } finally {
+      replySendButton.disabled = false;
+    }
+  }
+
+  async function encryptReplyPayload(reply) {
+    if (!replyEncryptionKey) {
+      throw new Error("Reply encryption key is unavailable. Reload and verify again.");
+    }
+
+    const createdAt = new Date().toISOString();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const plaintext = encoder.encode(JSON.stringify({
+      to: reply.to,
+      subject: reply.subject,
+      text: reply.text,
+      sentAt: createdAt,
+      originalPortalId: portalIdInput.value
+    }));
+    const encrypted = new Uint8Array(await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        tagLength: 128,
+        additionalData: encoder.encode("unsync-portal-reply:v1:" + portalIdInput.value + ":" + createdAt)
+      },
+      replyEncryptionKey,
+      plaintext
+    ));
+    const authTag = encrypted.slice(encrypted.length - 16);
+    const ciphertext = encrypted.slice(0, encrypted.length - 16);
+
+    return {
+      version: 1,
+      type: "portal-reply",
+      cipher: "aes-256-gcm",
+      createdAt,
+      encryptedBody: {
+        iv: toBase64Url(iv),
+        ciphertext: toBase64Url(ciphertext),
+        authTag: toBase64Url(authTag)
+      }
+    };
+  }
+
+  function setReplyStatus(message, kind) {
+    replyStatus.textContent = message;
+    replyStatus.classList.toggle("is-error", kind === "error");
+    replyStatus.classList.toggle("is-success", kind === "success");
   }
 
   async function downloadAttachment(attachment, button) {
@@ -2869,8 +3249,14 @@ const readerJs = `
     plaintextSubject = "";
     plaintextBody = "";
     decryptedMetadata = null;
-    replyMailto = "";
-    forwardMailto = "";
+    replyTargetEmail = "";
+    replyPreparedSubject = "";
+    replyEncryptionKey = null;
+    replyModal.hidden = true;
+    replyToInput.value = "";
+    replySubjectInput.value = "";
+    replyBodyInput.value = "";
+    setReplyStatus("", "");
     messageSubject.textContent = "";
     messageBody.textContent = "";
     attachmentList.replaceChildren();
@@ -2991,6 +3377,34 @@ const readerJs = `
     }
 
     return "Unable to continue verification.";
+  }
+
+  async function friendlyReplyError(response) {
+    let code = "";
+
+    try {
+      code = (await response.json()).error || "";
+    } catch {
+      code = "";
+    }
+
+    if (response.status === 429) {
+      return "Too many reply attempts. Try again later.";
+    }
+
+    if (response.status === 403) {
+      return "Your secure session expired. Reload and verify again.";
+    }
+
+    if (code === "invalid_encrypted_reply") {
+      return "The encrypted reply package was not accepted.";
+    }
+
+    if (code === "invalid_notification_email") {
+      return "The sender address is not valid for notification.";
+    }
+
+    return "Unable to submit encrypted reply.";
   }
 })();
 `;
