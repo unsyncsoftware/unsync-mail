@@ -2663,6 +2663,7 @@ const readerJs = `
   let verifiedSessionToken = "";
   let idleTimer = 0;
   let idleController = null;
+  let replyCloseTimer = 0;
 
   form.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -3026,6 +3027,8 @@ const readerJs = `
       return;
     }
 
+    window.clearTimeout(replyCloseTimer);
+    replyCloseTimer = 0;
     replyToInput.value = replyTargetEmail;
     replySubjectInput.value = replyPreparedSubject;
     replyBodyInput.value = "";
@@ -3035,6 +3038,8 @@ const readerJs = `
   }
 
   function closeReplyComposer() {
+    window.clearTimeout(replyCloseTimer);
+    replyCloseTimer = 0;
     replyModal.hidden = true;
     replyBodyInput.value = "";
     setReplyStatus("", "");
@@ -3088,6 +3093,8 @@ const readerJs = `
         "success"
       );
       setState("Encrypted reply submitted.", "success");
+      window.clearTimeout(replyCloseTimer);
+      replyCloseTimer = window.setTimeout(closeReplyComposer, 1000);
     } catch (error) {
       setReplyStatus(error instanceof Error ? error.message : "Unable to send encrypted reply.", "error");
     } finally {
@@ -3256,6 +3263,8 @@ const readerJs = `
     replyToInput.value = "";
     replySubjectInput.value = "";
     replyBodyInput.value = "";
+    window.clearTimeout(replyCloseTimer);
+    replyCloseTimer = 0;
     setReplyStatus("", "");
     messageSubject.textContent = "";
     messageBody.textContent = "";
