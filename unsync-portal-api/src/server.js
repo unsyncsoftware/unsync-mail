@@ -767,7 +767,8 @@ async function handlePortalReply(request, response) {
   record.updatedAt = receivedAt;
   await persistRecords();
 
-  const notificationSent = await sendReplyNotificationEmail(notificationEmail)
+  const replyEmail = buildSecureReplyEmail(buildSecureReplyPackage(record.portalId, reply));
+  const notificationSent = await sendReplyNotificationEmail(notificationEmail, replyEmail)
     .catch(() => {
       logSecurityEvent("reply_notification_failed", {
         portalIdHash: hashLogValue(record.portalId),
@@ -1867,7 +1868,40 @@ async function sendOtpEmail(recipientEmail, otp) {
   await sendSmtpMail({ host, port: portValue, user, pass, from, to: recipientEmail, message });
 }
 
-async function sendReplyNotificationEmail(recipientEmail) {
+function buildSecureReplyPackage(portalId, reply) {
+  return {
+    version: 1,
+    type: "secure-portal-reply",
+    portalId,
+    replyId: reply.replyId,
+    receivedAt: reply.receivedAt,
+    encryptedPayload: reply.encryptedPayload,
+  };
+}
+
+function buildSecureReplyEmail(replyPackage) {
+  const encodedPackage = Buffer
+    .from(JSON.stringify(replyPackage), "utf8")
+    .toString("base64url");
+  const armoredPackage = [
+    "-----BEGIN UNSYNC SECURE PORTAL REPLY-----",
+    encodedPackage,
+    "-----END UNSYNC SECURE PORTAL REPLY-----",
+  ].join("\r\n");
+
+  return {
+    subject: "Unsync Secure Portal Reply Received",
+    body: [
+      "You have received an encrypted Secure Portal reply.",
+      "",
+      "Open this email in Hermes to decrypt automatically.",
+      "",
+      armoredPackage,
+    ].join("\r\n"),
+  };
+}
+
+async function sendReplyNotificationEmail(recipientEmail, replyEmail) {
   const host = process.env.SMTP_HOST;
   const portValue = Number(process.env.SMTP_PORT ?? 465);
   const user = process.env.SMTP_USER;
@@ -1878,12 +1912,8 @@ async function sendReplyNotificationEmail(recipientEmail) {
     return false;
   }
 
-  const subject = "Unsync Secure Portal Reply Received";
-  const body = [
-    "A Secure Portal reply was submitted.",
-    "",
-    "The reply body is stored encrypted and was not included in this notification.",
-  ].join("\r\n");
+  const subject = replyEmail.subject;
+  const body = replyEmail.body;
   const message = [
     `From: ${from}`,
     `To: ${recipientEmail}`,
