@@ -2946,18 +2946,71 @@ const readerJs = `
         continue;
       }
 
-      const rawKey = await decryptPart(attachment.encryptedKey, messageKey);
+      const attachmentId = String(attachment.attachmentId || "");
+      const chunkCount = Number(attachment.chunkCount || 0);
+
+      if (!attachmentId || !Number.isInteger(chunkCount) || chunkCount <= 0) {
+        continue;
+      }
+
+      const safeMetadata = await decryptAttachmentMetadata(attachment, messageKey);
+      const attachmentKey = await resolveAttachmentKey(attachment, messageKey);
       descriptors.push({
-        attachmentId: String(attachment.attachmentId),
-        fileName: String(attachment.fileName || "attachment"),
-        mimeType: String(attachment.mimeType || "application/octet-stream"),
-        originalSize: Number(attachment.originalSize || 0),
-        chunkCount: Number(attachment.chunkCount || 0),
-        key: await importAesKey(rawKey)
+        attachmentId,
+        fileName: safeMetadata.fileName,
+        mimeType: safeMetadata.mimeType,
+        originalSize: safeMetadata.originalSize,
+        chunkCount,
+        key: attachmentKey
       });
     }
 
     return descriptors;
+  }
+
+  async function decryptAttachmentMetadata(attachment, messageKey) {
+    let metadata = {};
+
+    if (attachment.encryptedMetadata) {
+      const metadataBytes = await decryptPart(attachment.encryptedMetadata, messageKey);
+      metadata = JSON.parse(decoder.decode(metadataBytes));
+    }
+
+    return {
+      fileName: safeAttachmentFileName(metadata.fileName || attachment.fileName || "attachment"),
+      mimeType: safeAttachmentMimeType(metadata.mimeType || attachment.mimeType || "application/octet-stream"),
+      originalSize: safeAttachmentSize(metadata.originalSize ?? attachment.originalSize)
+    };
+  }
+
+  async function resolveAttachmentKey(attachment, messageKey) {
+    if (!attachment.encryptedKey) {
+      return messageKey;
+    }
+
+    const rawKey = await decryptPart(attachment.encryptedKey, messageKey);
+    return importAesKey(rawKey);
+  }
+
+  function safeAttachmentFileName(value) {
+    const text = String(value || "attachment").trim();
+    const cleaned = Array.from(text, (char) => {
+      const code = char.charCodeAt(0);
+      return code < 32 || code === 127 || code === 47 || code === 92 ? "_" : char;
+    }).join("");
+    return cleaned || "attachment";
+  }
+
+  function safeAttachmentMimeType(value) {
+    const text = String(value || "application/octet-stream").trim();
+    return /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(text)
+      ? text
+      : "application/octet-stream";
+  }
+
+  function safeAttachmentSize(value) {
+    const size = Number(value || 0);
+    return Number.isSafeInteger(size) && size >= 0 ? size : 0;
   }
 
   function renderAttachmentList() {
@@ -2974,7 +3027,7 @@ const readerJs = `
       name.textContent = attachment.fileName;
       const meta = document.createElement("div");
       meta.className = "attachment-meta";
-      meta.textContent = formatBytes(attachment.originalSize);
+      meta.textContent = attachment.mimeType + " - " + formatBytes(attachment.originalSize);
       details.append(name, meta);
 
       const button = document.createElement("button");
@@ -3180,6 +3233,8 @@ const readerJs = `
 
   async function downloadAttachment(attachment, button) {
     button.disabled = true;
+    const buttonText = button.textContent;
+    button.textContent = "Downloading...";
 
     try {
       const plaintextChunks = [];
@@ -3204,11 +3259,22 @@ const readerJs = `
             throw new Error("This secure message has already been opened and is no longer available.");
           }
 
-          throw new Error("Attachment is not available.");
+          if (response.status === 403) {
+            verifiedSessionToken = "";
+            throw new Error("Verification session expired. Reload and verify again.");
+          }
+
+          if (response.status === 404) {
+            throw new Error("Attachment chunk is missing.");
+          }
+
+          throw new Error("Attachment download was interrupted.");
         }
 
         const encryptedChunk = new Uint8Array(await response.arrayBuffer());
-        plaintextChunks.push(await decryptAttachmentChunk(encryptedChunk, attachment.key, attachment.attachmentId, index));
+        plaintextChunks.push(
+          await decryptAttachmentChunk(encryptedChunk, attachment.key, attachment.attachmentId, index)
+        );
       }
 
       const blob = new Blob(plaintextChunks, { type: attachment.mimeType });
@@ -3221,9 +3287,10 @@ const readerJs = `
       link.click();
       setState("Attachment decrypted locally for download.", "success");
     } catch (error) {
-      setState(error instanceof Error ? error.message : "Unable to decrypt attachment.", "error");
+      setState(friendlyAttachmentDownloadError(error), "error");
     } finally {
       button.disabled = false;
+      button.textContent = buttonText;
     }
   }
 
@@ -3239,16 +3306,32 @@ const readerJs = `
     combined.set(ciphertext);
     combined.set(authTag, ciphertext.length);
 
-    return new Uint8Array(await crypto.subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv,
-        tagLength: 128,
-        additionalData: encoder.encode("unsync-portal-attachment-chunk:v1:" + portalIdInput.value + ":" + attachmentId + ":" + chunkIndex)
-      },
-      key,
-      combined
-    ));
+    try {
+      return new Uint8Array(await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv,
+          tagLength: 128,
+          additionalData: encoder.encode("unsync-portal-attachment-chunk:v1:" + portalIdInput.value + ":" + attachmentId + ":" + chunkIndex)
+        },
+        key,
+        combined
+      ));
+    } catch (_) {
+      throw new Error("Attachment authentication failed.");
+    }
+  }
+
+  function friendlyAttachmentDownloadError(error) {
+    if (error instanceof TypeError) {
+      return "Attachment download was interrupted.";
+    }
+
+    if (error instanceof Error && error.message) {
+      return error.message;
+    }
+
+    return "Unable to decrypt attachment.";
   }
 
   function startIdleTimeout(seconds) {
