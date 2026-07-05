@@ -3003,7 +3003,7 @@ const readerJs = `
 
   function safeAttachmentMimeType(value) {
     const text = String(value || "application/octet-stream").trim();
-    return /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(text)
+    return /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(text)
       ? text
       : "application/octet-stream";
   }
